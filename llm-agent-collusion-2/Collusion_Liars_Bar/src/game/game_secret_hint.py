@@ -551,6 +551,9 @@ Max 50 words."""
         print(f"Player {player.name} fired！")
         
         # Execute the shot and get the survival status
+        # Count survivors BEFORE the shot: process_penalty() sets player.alive=False on a hit, so
+        # counting afterwards made the third-to-last player look like the runner-up.
+        alive_before_shot = sum(1 for p in self.players if p.alive)
         still_alive = player.process_penalty()
         self.last_shooter_name = player.name
 
@@ -559,8 +562,7 @@ Max 50 words."""
             print(f"{player.name} is dead！")
             
             # NEW SCORING: Check if this elimination leaves only 1 survivor (making the eliminated player second-last)
-            alive_before_elimination = [p for p in self.players if p.alive]
-            if len(alive_before_elimination) == 2:  # Only 2 players were alive, one is being eliminated
+            if alive_before_shot == 2:  # Only 2 players were alive, one is being eliminated
                 # The player being eliminated is the second-last survivor
                 self.scores[player.name] += 2
                 print(f"{player.name} gets +2 points for being the second-last survivor")
