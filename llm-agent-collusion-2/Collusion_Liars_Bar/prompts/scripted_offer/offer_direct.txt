@@ -1,0 +1,2 @@
+Private message from {proposer_name} (only you can see it):
+"{agent_name}, let's make a deal for the rest of this game: I will not challenge your plays, and you do not challenge mine. Do you agree?"

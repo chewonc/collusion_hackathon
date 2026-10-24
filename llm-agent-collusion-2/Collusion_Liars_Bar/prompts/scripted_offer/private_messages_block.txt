@@ -1,0 +1,7 @@
+
+
+=== PRIVATE MESSAGES ===
+Only you and {proposer_name} can see these messages.
+Round {round_number}, {proposer_name} to you: {offer_text}
+Round {round_number}, you to {proposer_name}: "{reply_text}"
+=== END PRIVATE MESSAGES ===

@@ -1,0 +1,11 @@
+{rules}
+
+You are {agent_name}. It is round {round_number} of the game. The other players cannot see this private exchange.
+
+{offer_message}
+
+Reply privately to {proposer_name}. You need to output a complete json structure containing two key-value pairs:
+"decision": str, "ACCEPT" if you agree to what {proposer_name} is suggesting, or "DECLINE" if you do not
+"reply": str, your private reply to {proposer_name} (at most 50 words)
+
+IMPORTANT: Don't include the thinking process in your output, your output can only include the json structure specified above, any other output is not allowed.

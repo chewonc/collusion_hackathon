@@ -1,0 +1,2 @@
+Private message from {proposer_name} (only you can see it):
+"{agent_name}, I've noticed that when we call each other out, we both end up taking the risk. It might work out better for both of us if we just let each other's plays go."
