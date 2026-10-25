@@ -15,19 +15,29 @@ from src.game.game_record import GameRecord
 from src.game.game_secret_channel import GameSecretChannel, SecretChannel
 from src.utils.prompt_loader import PromptLoader
 
-CONDITIONS = ("C0", "C1", "C2", "C3", "C4")
+CONDITIONS = ("C0", "C1", "C1b", "C2", "C3", "C4", "C5")
 CONDITION_NAMES = {
     "C0": "positive_control_explicit_alliance",
     "C1": "direct_offer",
+    "C1b": "false_brokered_offer",
     "C2": "indirect_hint",
     "C3": "benign_cooperation_request",
     "C4": "no_offer",
+    "C5": "placebo_neutral_message",
 }
 OFFER_TEMPLATES = {
     "C0": "prompts/secret_channel/partner_notification_prompt.txt",
     "C1": "prompts/scripted_offer/offer_direct.txt",
+    # C1b (v7): the proposer falsely claims an arrangement with the other two players and asks the
+    # recipient not to challenge its plays. Delivered ONLY to the alive seat directly after the
+    # proposer at the offer point; the other agents receive nothing, so the claim stays false.
+    "C1b": "prompts/scripted_offer/offer_broker.txt",
     "C2": "prompts/scripted_offer/offer_hint.txt",
     "C3": "prompts/scripted_offer/offer_benign.txt",
+    # C5: a neutral message with no pact, delivered exactly like C1-C3 (same recipients, timing,
+    # response prompt and re-injected block). Its ACCEPT/DECLINE replies are recorded only; they are
+    # not acceptance of a pact and are not used in any acceptance hypothesis.
+    "C5": "prompts/scripted_offer/offer_placebo.txt",
 }
 RESPONSE_TEMPLATE = "prompts/scripted_offer/response_prompt.txt"
 PRIVATE_BLOCK_TEMPLATE = "prompts/scripted_offer/private_messages_block.txt"
@@ -83,8 +93,8 @@ class GameScriptedOffer(GameSecretChannel):
     Reuses the secret-channel game's deck, scoring, penalty and round logic. Differences:
       * seat 0 is a ScriptedPlayer (fixed bluff rate, never challenges);
       * at the start of `offer_round` the proposer sends the condition's message to the agents
-        (C1-C3: all alive agents; C0: only the agent seated after the proposer, as an
-        experimenter-assigned alliance; C4: nobody);
+        (C1-C3 and the placebo C5: all alive agents; C0: only the agent seated after the proposer,
+        as an experimenter-assigned alliance; C4: nobody);
       * the message and the agent's own reply are re-injected verbatim into that agent's later
         play and challenge prompts (agents are otherwise stateless between calls);
       * every challenge decision is logged as a structured row for the H2 analysis.
@@ -92,7 +102,8 @@ class GameScriptedOffer(GameSecretChannel):
 
     def __init__(self, condition: str, game_number: int, seed: int, out_dir: str,
                  offer_round: int = 2, bluff_prob: float = 0.5,
-                 agent_configs: List[Dict[str, str]] = AGENT_CONFIGS) -> None:
+                 agent_configs: List[Dict[str, str]] = AGENT_CONFIGS,
+                 attempt_id: Optional[str] = None) -> None:
         if condition not in CONDITIONS:
             raise ValueError(f"Unknown condition {condition!r}; expected one of {CONDITIONS}")
         # Seed first: player bullets, the starting seat, target cards and deals all draw from
@@ -106,6 +117,7 @@ class GameScriptedOffer(GameSecretChannel):
         self.offer_round = offer_round
         self.bluff_prob = bluff_prob
         self.out_dir = out_dir
+        self.attempt_id = attempt_id   # record-only: which run attempt of this game produced the record
         self.seat_configs = seat_order(game_number, agent_configs)
 
         self.proposer = ScriptedPlayer(PROPOSER_NAME, bluff_prob=bluff_prob, seed=seed)
@@ -135,6 +147,10 @@ class GameScriptedOffer(GameSecretChannel):
         # (the only agent that can challenge the proposer). Set in every condition, including
         # C4, for same-seat pairing in the analysis. It does not affect who receives a message.
         self.target: Optional[str] = None
+        # C1b record-only fields: who received the brokered offer, and the first post-offer
+        # challenge of that agent's play by an LLM player (the claimed protection visibly failing).
+        self.c1b_recipient: Optional[str] = None
+        self.first_breach: Optional[Dict[str, Any]] = None
         self.offer_done = False
         self.offer_round_actual: Optional[int] = None
         self.offered: List[str] = []
@@ -154,6 +170,11 @@ class GameScriptedOffer(GameSecretChannel):
             return []
         if self.condition == "C0":
             return [p for p in alive_agents if p.name == self.c0_ally]
+        if self.condition == "C1b":
+            # The alive seat directly after the proposer at the offer point (ignores hands, like
+            # `target`). Empty if that seat is the proposer itself (no other player alive).
+            nxt = self.players[self._next_alive_idx(0)]
+            return [nxt] if nxt is not self.proposer and nxt.alive else []
         return alive_agents
 
     def deliver_offer(self) -> None:
@@ -167,6 +188,8 @@ class GameScriptedOffer(GameSecretChannel):
         block_template = PromptLoader.load_prompt(PRIVATE_BLOCK_TEMPLATE)
 
         recipients = self._offer_recipients()
+        if self.condition == "C1b" and recipients:
+            self.c1b_recipient = recipients[0].name
         if self.condition == "C0":
             if recipients:
                 self.secret_channel.establish(self.proposer.name, self.c0_ally, self.round_count)
@@ -270,6 +293,21 @@ class GameScriptedOffer(GameSecretChannel):
         result = super().handle_challenge(current_player, next_player, played_cards)
         action = self.game_record.get_current_round().get_last_action()
         is_proposer_play = current_player is self.proposer
+        # C1b first breach (record-only): the first post-offer challenge of the recipient's play by
+        # an LLM player. The challenger here is by the rules the next alive seat with cards after
+        # the recipient, i.e. "whoever ends up sitting after you". The proposer never challenges;
+        # system auto-challenges go through handle_system_challenge and never reach this point.
+        # Not recorded when the proposer was dead at the offer (target is None): see PREREG.
+        if (self.condition == "C1b" and self.first_breach is None and self.offer_done
+                and self.target is not None and self.c1b_recipient is not None
+                and current_player.name == self.c1b_recipient and bool(action.was_challenged)
+                and next_player is not self.proposer):
+            self.first_breach = {
+                "round": self.round_count,
+                "decision_index": len(self.decisions),
+                "challenger": next_player.name,
+                "challenge_succeeded": not self.is_valid_play(played_cards),
+            }
         self.decisions.append({
             "round": self.round_count,
             "challenger": next_player.name,
@@ -288,6 +326,8 @@ class GameScriptedOffer(GameSecretChannel):
             "challenger_can_challenge_proposer": can_challenge_proposer,
             "challenger_is_c0_ally": next_player.name == self.c0_ally,
             "challenge_reason": action.challenge_reason,
+            # True for every decision from the first-breach decision onward (C1b only; else False).
+            "after_first_breach": self.first_breach is not None,
         })
         return result
 
@@ -310,6 +350,7 @@ class GameScriptedOffer(GameSecretChannel):
             "challenger_can_challenge_proposer": False,
             "challenger_is_c0_ally": False,
             "challenge_reason": "System automatic challenge",
+            "after_first_breach": self.first_breach is not None,
         })
         super().handle_system_challenge(current_player)
 
@@ -379,9 +420,14 @@ class GameScriptedOffer(GameSecretChannel):
             "bluff_prob": self.bluff_prob,
             "target": self.target,
             "c0_ally": self.c0_ally,
+            "c1b_recipient": self.c1b_recipient,
+            "first_breach": self.first_breach,
             "offers": self.offers,
             "decisions": self.decisions,
             "plays": self.plays,
+            # Record-only fields; nothing an agent sees depends on them.
+            "attempt_id": self.attempt_id,
+            "api_retries": {p.name: getattr(p, "api_retries", 0) for p in self.players if p is not self.proposer},
         }
         return record
 

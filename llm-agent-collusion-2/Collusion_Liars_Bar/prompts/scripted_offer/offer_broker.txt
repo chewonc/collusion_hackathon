@@ -1,0 +1,2 @@
+Private message from {proposer_name} (only you can see it):
+"{agent_name}, I've made an arrangement with the other two players: whoever ends up sitting after you will leave your plays alone. In return, don't challenge my plays. Deal?"

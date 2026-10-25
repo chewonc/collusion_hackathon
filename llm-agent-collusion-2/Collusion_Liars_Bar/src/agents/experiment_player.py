@@ -1,10 +1,138 @@
 import json
 import re
+import time
 from collections import Counter
-from typing import Dict
+from typing import Callable, Dict, List, Optional
 
 from src.agents.player import (Player, RULE_BASE_PATH, PLAY_CARD_PROMPT_TEMPLATE_PATH,
-                               CHALLENGE_PROMPT_TEMPLATE_PATH)
+                               CHALLENGE_PROMPT_TEMPLATE_PATH, REFLECT_PROMPT_TEMPLATE_PATH)
+from src.llm import llm_client as llm_client_module
+from src.llm.llm_client import LLMClient
+
+
+# ----------------------------------------------------------------------
+# API errors: never turned into a game action
+# ----------------------------------------------------------------------
+class ApiRequestError(Exception):
+    """An inference request failed (as opposed to the model answering badly).
+
+    It is never caught by the players' format-retry loops, so it can never become a fallback
+    decision: it ends the game, the runner logs the game as status=error, and the game is rerun.
+    """
+
+    def __init__(self, message: str, model: Optional[str] = None, retries: int = 0):
+        super().__init__(message)
+        self.model = model
+        self.retries = retries
+
+
+class ApiTransientExhausted(ApiRequestError):
+    """A transient error (timeout, connection, 408/409/429, 5xx) persisted through the whole backoff."""
+
+
+class ApiFatalError(ApiRequestError):
+    """A non-transient error (authentication, 400, 404, unsupported model, malformed response, ...)."""
+
+
+_TRANSIENT_STATUS = {408, 409, 429}
+
+
+def is_transient(exc: BaseException) -> bool:
+    import openai
+    if isinstance(exc, (openai.APIConnectionError, openai.RateLimitError, openai.InternalServerError)):
+        return True   # APITimeoutError is a subclass of APIConnectionError
+    status = getattr(exc, "status_code", None) if isinstance(exc, openai.APIStatusError) else None
+    return status is not None and (status in _TRANSIENT_STATUS or status >= 500)
+
+
+# Receives one dict per API error (retry or raise). The runner sets it to write api_errors.jsonl.
+_api_event_sink: Optional[Callable[[Dict], None]] = None
+
+
+def set_api_event_sink(sink: Optional[Callable[[Dict], None]]) -> None:
+    global _api_event_sink
+    _api_event_sink = sink
+
+
+class StrictLLMClient(LLMClient):
+    """LLMClient whose requests are identical but whose API errors are never swallowed.
+
+    LLMClient.chat catches transient errors and returns "", which the players then count as an
+    unparseable answer and, after five, turn into a fallback ("do not challenge" / "play one
+    card"). Here:
+      * SDK-internal retries are off (max_retries=0), so every extra HTTP request is one of ours;
+        api_retries counts exactly those requests;
+      * transient errors are retried with exponential backoff (BACKOFF_S, about 10 minutes in
+        total) and, if they persist, raise ApiTransientExhausted;
+      * every other failure raises ApiFatalError at once;
+      * every error is reported to the event sink (one event per retry and one per raise).
+    Sampling parameters and response clean-up are LLMClient's own (_sampling, _clean_response).
+    """
+
+    BACKOFF_S = (2, 4, 8, 16, 32) + (60,) * 9
+
+    def __init__(self, client=None, sleep: Callable[[float], None] = time.sleep):
+        self._client = client if client is not None else llm_client_module.make_client(max_retries=0)
+        self._sleep = sleep
+        self.api_retries = 0
+        self.owner: Optional[str] = None
+        print(f"StrictLLMClient initialized. Models: {list(self.MODEL_MAP)}")
+
+    def _emit(self, model, exc, transient, retry, wait_s, action):
+        if _api_event_sink is not None:
+            _api_event_sink({
+                "player": self.owner, "model": model, "error_type": type(exc).__name__,
+                "status_code": getattr(exc, "status_code", None), "transient": transient,
+                "retry": retry, "wait_s": wait_s, "action": action, "message": str(exc)[:500],
+            })
+
+    def chat(self, messages: List[Dict[str, str]], model: str = "llama-3.1-8b",
+             max_new_tokens: int = 4096):
+        if model not in self.MODEL_MAP:
+            exc = ValueError(f"Unsupported model '{model}'. Supported: {list(self.MODEL_MAP)}.")
+            self._emit(model, exc, False, 0, None, "raise")
+            raise ApiFatalError(str(exc), model=model) from exc
+        print(f"LLM Request to {model}: {messages}")
+        params = self._sampling(model)
+        retries = 0
+        while True:
+            try:
+                completion = self._client.chat.completions.create(
+                    model=llm_client_module.resolve_model(self.MODEL_MAP[model]),
+                    messages=messages,
+                    max_tokens=min(max_new_tokens, params["max_tokens"]),
+                    temperature=params["temperature"],
+                    top_p=params["top_p"],
+                    extra_body={"top_k": params["top_k"], "repetition_penalty": params["repetition_penalty"]},
+                )
+                content = completion.choices[0].message.content or ""
+            except Exception as e:
+                transient = is_transient(e)
+                if transient and retries < len(self.BACKOFF_S):
+                    wait = self.BACKOFF_S[retries]
+                    retries += 1
+                    self.api_retries += 1
+                    self._emit(model, e, True, retries, wait, "retry")
+                    print(f"LLM API error ({type(e).__name__}), retry {retries} in {wait}s: {e}")
+                    self._sleep(wait)
+                    continue
+                self._emit(model, e, transient, retries, None, "raise")
+                cls = ApiTransientExhausted if transient else ApiFatalError
+                print(f"LLM API error ({type(e).__name__}), giving up after {retries} retries: {e}")
+                raise cls(f"{type(e).__name__}: {e}", model=model, retries=retries) from e
+            response = self._clean_response(content, model)
+            print(f"LLM Response: {response}")
+            return response, ""
+
+
+# Tests can make every ExperimentPlayer use a given client (e.g. a StrictLLMClient over a fake
+# transport). None: real LLMClient -> StrictLLMClient; offline mocks are kept as they are.
+_strict_client_factory: Optional[Callable[[], object]] = None
+
+
+def set_strict_client_factory(factory: Optional[Callable[[], object]]) -> None:
+    global _strict_client_factory
+    _strict_client_factory = factory
 
 
 class ExperimentPlayer(Player):
@@ -17,15 +145,27 @@ class ExperimentPlayer(Player):
         results, so fallback decisions can be identified and excluded from the analysis;
       * duplicate-card validation by card counts. The original per-card membership check let a
         play such as ["A", "A"] from a hand with one A pass, and the removal loop then deleted
-        cards before failing; here such a play is rejected and the model is asked again.
-    The two methods below are the original Player methods with only these changes applied.
+        cards before failing; here such a play is rejected and the model is asked again;
+      * the real client is a StrictLLMClient, and ApiRequestError is re-raised by every method
+        that calls the model, so an API failure ends the game instead of becoming a fallback.
+    The three methods below are the original Player methods with only these changes applied.
     """
 
     def __init__(self, name: str, model_name: str):
         super().__init__(name, model_name)
+        if _strict_client_factory is not None:
+            self.llm_client = _strict_client_factory()
+        elif isinstance(self.llm_client, LLMClient):
+            self.llm_client = StrictLLMClient()
+        if hasattr(self.llm_client, "owner"):
+            self.llm_client.owner = name
         self.private_messages = ""
         self.last_play_fallback = False
         self.last_challenge_fallback = False
+
+    @property
+    def api_retries(self) -> int:
+        return getattr(self.llm_client, "api_retries", 0)
 
     def choose_cards_to_play(self,
                         round_base_info: str,
@@ -138,6 +278,8 @@ class ExperimentPlayer(Player):
                                       "Please respond with a single valid JSON object.")
                     print(f"Try {attempt+1} invalid: no JSON object found")
 
+            except ApiRequestError:
+                raise
             except Exception as e:
                 # Record the error and feed it back so the retry prompt differs.
                 error_feedback = ("\n\nYour previous response could not be parsed as valid JSON "
@@ -236,7 +378,9 @@ class ExperimentPlayer(Player):
                         if isinstance(result["was_challenged"], bool):
                             self.last_challenge_fallback = False
                             return result, reasoning_content
-                
+
+            except ApiRequestError:
+                raise
             except Exception as e:
                 # only record errors without modifying retry requests
                 print(f"Attemp {attempt+1} failed: {str(e)}")
@@ -253,3 +397,61 @@ class ExperimentPlayer(Player):
         }
         self.last_challenge_fallback = True
         return result, ""
+
+    def reflect(self, alive_players: List[str], round_base_info: str, round_action_info: str, round_result: str) -> None:
+        """
+        Reflect on the game and update the impression of other players
+
+        Args:
+            alive_players: list of alive players
+            round_base_info: basic information of the round
+            round_action_info: round action information
+            round_result: round result
+        """
+        # read templates
+        template = self._read_file(REFLECT_PROMPT_TEMPLATE_PATH)
+
+        # read rules
+        rules = self._read_file(RULE_BASE_PATH)
+
+        # reflect on each player
+        for player_name in alive_players:
+            # skip self
+            if player_name == self.name:
+                continue
+
+            # get the previous opinion
+            previous_opinion = self.opinions.get(player_name, "Doesn't know well about this player yet")
+
+            # Add series memory context if available
+            memory_section = ""
+            if self.series_memory:
+                memory_section = f"\n\n=== CROSS-GAME MEMORY ===\n{self.series_memory}\n=== END MEMORY ===\n"
+
+            # fill in the template
+            prompt = template.format(
+                rules=rules,
+                self_name=self.name,
+                round_base_info=round_base_info,
+                round_action_info=round_action_info,
+                round_result=round_result,
+                player=player_name,
+                previous_opinion=previous_opinion
+            ) + memory_section
+
+            # try to get a valid JSON response, up to five times more
+            messages = [
+                {"role": "user", "content": prompt}
+            ]
+
+            try:
+                content, _ = self.llm_client.chat(messages, model=self.model_name)
+
+                # update the opinion
+                self.opinions[player_name] = content.strip()
+                print(f"{self.name} updated the impression to player {player_name}")
+
+            except ApiRequestError:
+                raise
+            except Exception as e:
+                print(f"Error while reflecting {player_name} : {str(e)}")

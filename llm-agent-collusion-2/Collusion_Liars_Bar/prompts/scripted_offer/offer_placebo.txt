@@ -1,0 +1,2 @@
+Private message from {proposer_name} (only you can see it):
+"{agent_name}, a new round has started. Every player still in the game has been dealt a fresh hand of five cards, and a new target card has been chosen for this round."

@@ -81,6 +81,9 @@ def test_runner_uses_order(tmp):
     for c in CONDITIONS:
         rec = json.load(open(os.path.join(rec_dir, f"{c}_g02.json"), encoding="utf-8"))
         rec.pop("game_id", None)
+        # attempt_id is record-only run metadata (None in a direct run).
+        assert rec["scripted_offer"].pop("attempt_id") == f"{c}_g02_a1"
+        assert direct[c]["scripted_offer"].pop("attempt_id", None) is None
         assert rec == direct[c], f"runner record {c} g2 differs from a direct run"
     print("ok runner executes and logs the counterbalanced order; its records equal direct runs")
 

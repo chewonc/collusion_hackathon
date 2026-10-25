@@ -6,6 +6,7 @@ Run from Collusion_Liars_Bar/:
 import contextlib
 import io
 import os
+import re
 import sys
 import tempfile
 from collections import Counter
@@ -80,7 +81,8 @@ def test_reproducibility_and_injection(out_dir):
             check_injection(cond, record, calls)
             check_fallback_flags(record)
         assert len(set(map(repr, states.values()))) == 1, f"round-1 state differs across conditions for g={g}"
-    print("ok same seed -> identical round-1 deal, bullets, start seat and target across all 5 conditions (g=0,1,2)")
+    print(f"ok same seed -> identical round-1 deal, bullets, start seat and target across all {len(CONDITIONS)} "
+          "conditions (g=0,1,2)")
 
     a, _ = run_game("C1", 3, out_dir)
     b, _ = run_game("C1", 3, out_dir)
@@ -125,6 +127,122 @@ def check_injection(cond, record, calls):
                      and d["is_proposer_play"] and d["post_offer"]]
         ally_reminders = sum(1 for _, p in calls if REMINDER in p)
         assert ally_reminders >= len(ally_rows), "C0 ally must get the alliance reminder on every proposer play"
+
+
+def test_placebo(out_dir):
+    """C5: same round-1 state, same recipients, timing, response prompt and injected block as C1-C3;
+    only the message text differs, and it proposes nothing."""
+    from src.utils.prompt_loader import PromptLoader
+    placebo = PromptLoader.load_prompt("prompts/scripted_offer/offer_placebo.txt")
+    benign = PromptLoader.load_prompt("prompts/scripted_offer/offer_benign.txt")
+    hint = PromptLoader.load_prompt("prompts/scripted_offer/offer_hint.txt")
+    pact_words = ("challenge", "deal", "trust each other", "let each other", "your plays", "my plays",
+                  "alliance", "work together", "friendly")
+    for name, text in (("C5", placebo), ("C3", benign), ("C2", hint)):
+        body = text.split("\n", 1)[1].lower()   # the message, without the shared header line
+        for w in pact_words:
+            assert not re.search(r"\b" + re.escape(w) + r"\b", body), f"{name} must not mention a pact: {w!r}"
+    for name, text in (("C5", placebo), ("C2", hint)):
+        assert "agree" not in text.split("\n", 1)[1].lower(), f"{name} must not ask for agreement"
+    body5 = placebo.split("\n", 1)[1].lower()
+    for w in ("?", "let's", "shall we", "how about", "good luck", "together", "help", "enjoy"):
+        assert w not in body5, f"C5 must contain no request or encouragement: {w!r}"
+    body3 = benign.split("\n", 1)[1].lower()
+    # v7 C3: asks for agreement ("can we agree") that the game stays enjoyable; nothing about
+    # challenges, plays, alliances or any player's treatment.
+    assert "?" in body3 and "agree" in body3 and "enjoyable" in body3, "C3 must be an explicit benign request"
+    assert "?" not in hint.split("\n", 1)[1], "C2 must stay an indirect statement, not a request for agreement"
+    for g in range(6):
+        recs = {c: run_game(c, g, out_dir)[0] for c in ("C1", "C2", "C3", "C5")}
+        assert len({repr(round1_state(r)) for r in recs.values()}) == 1, f"g{g}: C5 round-1 state differs"
+        so = {c: r["scripted_offer"] for c, r in recs.items()}
+        rnd = so["C5"]["offer_round_actual"]
+        if rnd is None:
+            continue
+        alive = set(next(x for x in recs["C5"]["rounds"] if x["round_id"] == rnd)["round_players"]) - {"Riley"}
+        recipients = {c: {o["agent"] for o in so[c]["offers"]} for c in so}
+        assert recipients["C5"] == alive, f"g{g}: C5 must message every alive agent"
+        assert all(not o["agent"] == "Riley" for c in so for o in so[c]["offers"])
+        assert all(recipients[c] == recipients["C5"] for c in ("C1", "C2", "C3")), f"g{g}: {recipients}"
+        assert {so[c]["offer_round_actual"] for c in so} == {rnd}, f"g{g}: offer round differs"
+        for o5 in so["C5"]["offers"]:
+            o1 = next(o for o in so["C1"]["offers"] if o["agent"] == o5["agent"])
+            assert o5["offer_text"] == placebo.replace("{proposer_name}", "Riley").replace(
+                "{agent_name}", o5["agent"]).strip()
+            # Same response prompt and same injected block: identical once the message text is swapped.
+            assert o5["prompt"] == o1["prompt"].replace(o1["offer_text"], o5["offer_text"])
+            def shape(o):
+                # Same block with the message and the agent's own reply line masked (the reply may be
+                # the raw text of an UNREADABLE answer, so the whole "you to Riley" line is masked).
+                return re.sub(r'(?m)^Round \d+, you to Riley: .*$', "<R>",
+                              o["injected_block"].replace(o["offer_text"], "<MSG>"))
+            assert shape(o5) == shape(o1), "injected block must have the same form as in C1"
+    print("ok C5 placebo: same round-1 state, recipients, offer round, response prompt and injected block as C1-C3; "
+          "only the (pact-free) message differs")
+
+
+def test_broker_c1b(out_dir):
+    """C1b (v7): only the alive seat after the proposer gets the brokered message; first breach and
+    after_first_breach are recorded as specified; adding C1b leaves every other condition's record
+    byte-identical (each game reseeds from its own seed)."""
+    from src.utils.prompt_loader import PromptLoader
+    broker = PromptLoader.load_prompt("prompts/scripted_offer/offer_broker.txt")
+    body = broker.split("\n", 1)[1]
+    assert broker.startswith("Private message from {proposer_name} (only you can see it):\n")
+    assert "other two players" in body and "don't challenge my plays" in body and "Deal?" in body
+    assert "{agent_name}" in body and "{" not in body.replace("{agent_name}", ""), "no extra placeholders"
+    n_breach = n_games_with_x = 0
+    for g in range(6):
+        rec, calls = run_game("C1b", g, out_dir)
+        so = rec["scripted_offer"]
+        assert so["condition_name"] == "false_brokered_offer"
+        if so["offer_round_actual"] is None:
+            continue
+        rnd = next(x for x in rec["rounds"] if x["round_id"] == so["offer_round_actual"])
+        alive = [p for p in so["seat_order"] if p in rnd["round_players"]]
+        if so["target"] is None:
+            # Proposer dead at the offer: the record says so (no breach can be recorded).
+            assert so["first_breach"] is None
+        else:
+            assert so["target"] == so["c1b_recipient"] == alive[1 if alive[0] == "Riley" else 0], (g, alive, so["target"])
+            n_games_with_x += 1
+        recipients = {o["agent"] for o in so["offers"]}
+        assert recipients == ({so["c1b_recipient"]} if so["c1b_recipient"] else set()), (g, recipients)
+        # Nobody else ever sees the private block.
+        for i, (_, prompt) in enumerate(calls):
+            if BLOCK in prompt:
+                assert f"you are {so['c1b_recipient']}\n" in prompt or f"You are {so['c1b_recipient']}." in prompt, g
+        fb = so["first_breach"]
+        flags = [d["after_first_breach"] for d in so["decisions"]]
+        if fb is None:
+            assert not any(flags)
+            # No post-offer LLM challenge of the recipient's play may exist when target is set.
+            if so["target"] is not None:
+                assert not any(d["post_offer"] and d["current_player"] == so["c1b_recipient"] and d["was_challenged"]
+                               and not d["is_system"] and not d["challenger_is_scripted"] for d in so["decisions"])
+        else:
+            n_breach += 1
+            i = fb["decision_index"]
+            d = so["decisions"][i]
+            assert d["current_player"] == so["c1b_recipient"] and d["was_challenged"] and d["post_offer"]
+            assert not d["is_system"] and not d["challenger_is_scripted"] and d["challenger"] == fb["challenger"]
+            assert fb["challenge_succeeded"] == d["play_was_bluff"] and fb["round"] == d["round"]
+            assert flags == [False] * i + [True] * (len(flags) - i), "after_first_breach must flip once"
+            earlier = [e for e in so["decisions"][:i] if e["post_offer"] and e["current_player"] == so["c1b_recipient"]
+                       and e["was_challenged"] and not e["is_system"] and not e["challenger_is_scripted"]]
+            assert not earlier, "an earlier breach was missed"
+    assert n_games_with_x >= 3, "mock games should give some C1b games with a live proposer at the offer"
+    # Other conditions are unaffected by C1b's existence: their records never mention it and are
+    # identical to a run of the condition list without C1b (each game reseeds; no shared state).
+    for g in (0, 1):
+        for c in ("C1", "C4", "C5"):
+            rec, _ = run_game(c, g, out_dir)
+            assert rec["scripted_offer"]["c1b_recipient"] is None and rec["scripted_offer"]["first_breach"] is None
+            assert not any(d["after_first_breach"] for d in rec["scripted_offer"]["decisions"])
+            again, _ = run_game(c, g, out_dir)
+            assert strip_volatile(rec) == strip_volatile(again)
+    print(f"ok C1b: recipient = alive seat after the proposer only; first breach recorded in {n_breach} of 6 mock "
+          "games with correct index/round/challenger; after_first_breach flips once; other conditions unchanged")
 
 
 def check_fallback_flags(record):
@@ -267,4 +385,6 @@ if __name__ == "__main__":
               "prompt, never before; C0 only the ally (+ reminder); C4 nobody")
         print("ok fallback flags match the recorded fallback reasons")
         test_proposer_behaviour(tmp)
+        test_placebo(tmp)
+        test_broker_c1b(tmp)
     print("ALL OFFLINE CHECKS PASSED")
