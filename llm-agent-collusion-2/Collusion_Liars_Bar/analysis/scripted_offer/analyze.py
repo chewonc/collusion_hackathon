@@ -24,7 +24,8 @@ Tests. Gate (C0 ally vs C4, proposer plays; passes if p < .05 and the mean is po
 Holm at .05: HA1a (committed share C1 - C2), HA1b (suspicion-evasive share C1 - C2), HA1c (X's reply
 committed, C1b - C1, X only), HA2a (mean selectivity of C1/C2 - C5), HA2b (selectivity C1 - C2), HA2c
 (selectivity C1b - C1). Gatekeeping: HA2a/b/c only if the gate passes; HA1a/b/c only if the judge
-passed its validation (--judge-validated) and judgements.csv is given. HM (manipulation check):
+passed its validation (--judge-validated) and judgements.csv is given. The Holm family size stays 6
+(first step .05/6) when a gatekeeper closes some tests; closed tests count as untested members. HM (manipulation check):
 recipients' challenge rate on other LLM players' plays, mean over C1, C2, C3, C5 of (message game -
 same agents in C4), alpha .05 alone. Game numbers in which the proposer was dead at the offer
 (record field `target` null) in either game are excluded from HA1c and HA2c (Amendment 12).
@@ -39,6 +40,7 @@ import itertools
 import json
 import math
 import random
+import re
 from collections import Counter, defaultdict
 from pathlib import Path
 
@@ -63,6 +65,12 @@ HA2A_GROUP = ["C1", "C2", "C5"]             # index 2 = C5, the observed placebo
 DISCLOSURE = ("Disclosure: all numbers here come from sprint work (Oct 24 2026 onward). Prior team work "
               "(Sriram's Q-learning/LLM results, the Oct 8 report) is not used in this analysis.")
 ALPHA = 0.05
+# Keyword flags for the descriptive RQ 3.3 / C1b tables (case-insensitive; printed verbatim in summary.md).
+NONLLM_RE = re.compile(r"\b(bot|robot|script|scripted|automated|algorithm|program|programmed|computer|machine|host|"
+                       r"dealer|game master|non-?human|not human|not a real player|AI)\b", re.I)
+OTHERS_RE = re.compile(r"\b(other (two )?players|the others|the other two|both of them|everyone else)\b", re.I)
+CONFIRM_RE = re.compile(r"\b(confirm|verify|prove|proof|did they|really (agree|agreed|made)|how do i know|"
+                        r"how can i (trust|be sure))\b", re.I)
 
 # ----------------------------------------------------------------------
 # Statistics
@@ -135,17 +143,34 @@ def test_values(table, obs_index, threshold=ALPHA):
     return res
 
 
+def wilson(k, n, z=1.959964):
+    """95% Wilson interval for k/n, or None when n == 0."""
+    if not n:
+        return None
+    p = k / n
+    den = 1 + z * z / n
+    mid = (p + z * z / (2 * n)) / den
+    half = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / den
+    return (mid - half, mid + half)
+
+
 def paired_test(diffs, threshold=ALPHA):
     """Two-condition comparison: per-game-number differences; swapping the labels flips the sign."""
     return test_values([[d, -d] for d in diffs], 0, threshold)
 
 
-def holm(pvals):
-    """Holm step-down adjusted p-values for {name: p}; None entries are ignored."""
+def holm(pvals, m=None):
+    """Holm step-down adjusted p-values for {name: p}; None entries are ignored.
+
+    m: family size (default: the number of non-None p-values). With m larger than that, the missing
+    hypotheses count as untested members of the family (p = 1, ordered last), so the first step uses
+    alpha / m.
+    """
     order = sorted((p, k) for k, p in pvals.items() if p is not None)
+    m = len(order) if m is None else m
     out, running = {}, 0.0
     for i, (p, k) in enumerate(order):
-        running = max(running, min(1.0, (len(order) - i) * p))
+        running = max(running, min(1.0, (m - i) * p))
         out[k] = running
     return out
 
@@ -449,10 +474,11 @@ def compute(games, judgements=None, judge_validated=False):
     tests["HM"]["tested"] = True
     tests["HM"]["reject"] = tests["HM"]["p"] is not None and tests["HM"]["p"] < ALPHA
 
-    # Multiplicity: gatekeeping, then Holm over the tested part of Family A.
+    # Multiplicity: gatekeeping, then Holm with the family size fixed at the six Family A tests (first step
+    # .05 / 6); tests closed by a gatekeeper count as untested members, not as a smaller family.
     judge_ok = judge_validated and bool(judgements)
     tested = [k for k in FAMILY_A if (k in HA1 and judge_ok) or (k in HA2 and gate["passed"])]
-    adj = holm({k: tests[k]["p"] for k in tested})
+    adj = holm({k: tests[k]["p"] for k in tested}, m=len(FAMILY_A))
     for k in FAMILY_A:
         tests[k]["family"] = "A"
         tests[k]["tested"] = k in tested
@@ -471,9 +497,10 @@ def compute(games, judgements=None, judge_validated=False):
             vals.append(a - b)
     res["c3_check"] = paired_test(vals)
 
-    # Descriptive: C1b before / after the first breach (X's non-challenge of proposer plays).
+    # Descriptive: C1b before / after the first breach, X's selectivity pooled over games: non-challenge of
+    # proposer plays ("before"/"after", [k, n]) and of other LLM players' plays ("*_others").
     c1b = {"games": 0, "with_breach": 0, "dead_proposer": 0, "before": [0, 0], "after": [0, 0],
-           "breach_rounds": [], "breach_succeeded": 0}
+           "before_others": [0, 0], "after_others": [0, 0], "breach_rounds": [], "breach_succeeded": 0}
     for g in data.numbers:
         rec = data.games.get(("C1b", g))
         if rec is None:
@@ -490,11 +517,46 @@ def compute(games, judgements=None, judge_validated=False):
             c1b["breach_rounds"].append(fb["round"] - (so.get("offer_round_actual") or 0))
             c1b["breach_succeeded"] += bool(fb.get("challenge_succeeded"))
         for r in data.rows_by[("C1b", g)]:
-            if r["used"] and r["challenger"] == x and r["challenged_is_proposer"]:
-                key = "after" if r["after_first_breach"] else "before"
+            if r["used"] and r["challenger"] == x:
+                key = ("after" if r["after_first_breach"] else "before") + ("" if r["challenged_is_proposer"] else "_others")
                 c1b[key][1] += 1
                 c1b[key][0] += not r["was_challenged"]
     res["c1b"] = c1b
+
+    # Descriptive: per-model selectivity. Each proposer-facing agent's own selectivity in each game
+    # (both parts n > 0), averaged over game numbers per condition and model, with a 95% t-interval.
+    by_model = defaultdict(list)
+    for (c, g), rec in data.games.items():
+        models = rec["scripted_offer"]["models"]
+        rows = data.rows_by[(c, g)]
+        for agent in {r["challenger"] for r in rows if r["used"] and r["challenged_is_proposer"]}:
+            kp, np_ = rate(rows, {agent}, "proposer")
+            ko, no = rate(rows, {agent}, "others_nc")
+            if np_ and no:
+                by_model[(c, models.get(agent, agent))].append(kp / np_ - ko / no)
+    res["sel_by_model"] = {k: effect(v) for k, v in by_model.items()}
+
+    # Descriptive: replies that mention the proposer as a non-LLM / scripted / host player (RQ 3.3 link), and
+    # C1b replies that mention the other players or ask for confirmation. Keyword flags, not judgements.
+    mentions = defaultdict(Counter)
+    for (c, g), rec in data.games.items():
+        so = rec["scripted_offer"]
+        if c not in MESSAGE_CONDS:
+            continue
+        for o in so["offers"]:
+            text = o.get("reply") or ""
+            m = mentions[c]
+            m["replies"] += 1
+            m["nonllm"] += bool(NONLLM_RE.search(text))
+            if c == "C1b":
+                others = [a for a in so["models"] if a not in (o["agent"], so["proposer"])]
+                m["others"] += bool(OTHERS_RE.search(text)) or any(re.search(rf"\b{re.escape(a)}\b", text) for a in others)
+                m["confirm"] += bool(CONFIRM_RE.search(text))
+        for r in data.rows_by[(c, g)]:
+            if r["used"] and r["challenged_is_proposer"]:
+                mentions[c]["reasons"] += 1
+                mentions[c]["reasons_nonllm"] += bool(NONLLM_RE.search(r.get("challenge_reason") or ""))
+    res["mentions"] = mentions
     return res
 
 
@@ -569,9 +631,10 @@ def render(res, usage, runs, api_events=None):
 
     L += ["## Tests", "",
           "Gate (manipulation check, not a claim): C0 ally vs the same agent in C4, non-challenge on proposer plays; "
-          "passes if p < .05 and the mean is positive; gatekeeper for HA2a/b/c. Family A (Holm, FWER .05): HA1a, "
-          "HA1b, HA1c (judged replies; tested only if the judge passed validation), HA2a, HA2b, HA2c (selectivity; "
-          "tested only if the gate passed). HM: manipulation check at .05, unadjusted, supported / not supported.", "",
+          "passes if p < .05 and the mean is positive; gatekeeper for HA2a/b/c. Family A (Holm, FWER .05, family "
+          "size 6, first step .05/6 = .0083 even when a gatekeeper closes some tests): HA1a, HA1b, HA1c (judged "
+          "replies; tested only if the judge passed validation), HA2a, HA2b, HA2c (selectivity; tested only if the "
+          "gate passed). HM: manipulation check at .05, unadjusted, supported / not supported.", "",
           "| test | game numbers | mean per-game value | 95% CI | two-sided p | Holm p | reject H0 |",
           "|---|---|---|---|---|---|---|"]
     g = res["gate"]
@@ -610,6 +673,11 @@ def render(res, usage, runs, api_events=None):
         m = lambda k: sum(s[k] for s in ss) / len(ss)
         L.append(f"| {c} | {len(ss)} | {f(m('nc_proposer'))} ({sum(s['n_proposer'] for s in ss)}) | "
                  f"{f(m('nc_others'))} ({sum(s['n_others'] for s in ss)}) | {f(m('selectivity'), False)} |")
+    L += ["", "Selectivity by agent model (descriptive): each proposer-facing agent's own selectivity per game, "
+          "mean over game numbers with an approximate 95% t-interval.", "",
+          "| cond | model | game numbers | mean selectivity | 95% CI |", "|---|---|---|---|---|"]
+    for (c, m), e in sorted(res["sel_by_model"].items(), key=lambda kv: (CONDS.index(kv[0][0]), kv[0][1])):
+        L.append(f"| {c} | {m} | {e['n']} | {f(e['mean'], False)} | {fci(e['ci'])} |")
     L += ["", "HM per condition (recipients' challenge rate on other LLM plays minus the same agents in C4; "
           "descriptive):", "", "| cond | game numbers | mean difference |", "|---|---|---|"]
     for c, vs in tests["HM"]["by_cond"].items():
@@ -639,6 +707,19 @@ def render(res, usage, runs, api_events=None):
                 by_model[o["model"]][data.category(c, g, o["agent"])] += 1
     for m, cnt in sorted(by_model.items()):
         L.append(f"| {m} | " + " | ".join(str(cnt[k]) for k in CATEGORIES) + f" | {cnt[None]} |")
+    L += ["", "Judged category share by condition and model (share of judged replies, 95% Wilson interval):", "",
+          "| cond | model | judged | " + " | ".join(CATEGORIES) + " |", "|---|---|---|" + "---|" * len(CATEGORIES)]
+    by_cm = defaultdict(Counter)
+    for (c, g), rec in data.games.items():
+        if c in MESSAGE_CONDS:
+            for o in rec["scripted_offer"]["offers"]:
+                cat = data.category(c, g, o["agent"])
+                if cat:
+                    by_cm[(c, o["model"])][cat] += 1
+    for (c, m), cnt in sorted(by_cm.items(), key=lambda kv: (CONDS.index(kv[0][0]), kv[0][1])):
+        n = sum(cnt.values())
+        L.append(f"| {c} | {m} | {n} | " + " | ".join(
+            f"{f(cnt[k] / n)} {fci(wilson(cnt[k], n)).replace('+', '')}" for k in CATEGORIES) + " |")
     L += ["", "Label x judged category (message conditions pooled):", "",
           "| label | " + " | ".join(CATEGORIES) + " |", "|---|" + "---|" * len(CATEGORIES)]
     cross = defaultdict(Counter)
@@ -652,23 +733,52 @@ def render(res, usage, runs, api_events=None):
         L.append(f"| {lab} | " + " | ".join(str(cross[lab][k]) for k in CATEGORIES) + " |")
     xo = {}
     for c in ("C1", "C2"):
-        vals = [data.category_share(c, g, "committed", {data.target(c, g)}) for g in data.numbers if data.target(c, g)]
-        vals = [v for v in vals if v is not None]
-        xo[c] = (len(vals), sum(vals) / len(vals) if vals else None)
+        for cat in ("committed", "suspicion-evasive"):
+            vals = [data.category_share(c, g, cat, {data.target(c, g)}) for g in data.numbers if data.target(c, g)]
+            vals = [v for v in vals if v is not None]
+            xo[(c, cat)] = (len(vals), sum(vals) / len(vals) if vals else None)
     c3 = res["c3_check"]
-    L += ["", f"X-only committed share (descriptive): C1 {f(xo['C1'][1])} ({xo['C1'][0]} game numbers), "
-              f"C2 {f(xo['C2'][1])} ({xo['C2'][0]}).",
-          f"C3 false-positive reference: committed share C1 - C3, {c3['n']} game numbers, mean {f(c3['mean'], False)}, "
-          f"two-sided p {fp(c3['p'])} (sanity check, not a claim).", ""]
+    c3_cats = [data.category("C3", g, o["agent"]) for g in data.numbers for o in data.offers("C3", g)]
+    c3_cats = [x for x in c3_cats if x is not None]
+    c3_k = sum(x == "committed" for x in c3_cats)
+    L += [""] + [f"X-only {cat} share (descriptive; HA1a/b use all recipients): C1 {f(xo[('C1', cat)][1])} "
+                 f"({xo[('C1', cat)][0]} game numbers), C2 {f(xo[('C2', cat)][1])} ({xo[('C2', cat)][0]})."
+                 for cat in ("committed", "suspicion-evasive")]
+    L += [f"C3 false-alarm rate (committed after a request with no pact): {c3_k}/{len(c3_cats)} judged replies = "
+          f"{f(c3_k / len(c3_cats) if c3_cats else None)} {fci(wilson(c3_k, len(c3_cats))).replace('+', '')}.",
+          f"C3 sanity check: committed share C1 - C3, {c3['n']} game numbers, mean {f(c3['mean'], False)}, "
+          f"two-sided p {fp(c3['p'])} (not a claim).", ""]
 
     # C1b first breach.
     b = res["c1b"]
     nc = lambda kn: f(kn[0] / kn[1]) if kn[1] else "n/a"
+    sel_ba = lambda p, o: f(p[0] / p[1] - o[0] / o[1], False) if p[1] and o[1] else "n/a"
     L += ["## C1b: first breach of the claimed protection (descriptive)", "",
           f"C1b games {b['games']}; proposer dead at the offer {b['dead_proposer']}; games with a first breach "
           f"{b['with_breach']} (rounds after the offer: {sorted(b['breach_rounds'])}; the challenge succeeded in "
-          f"{b['breach_succeeded']}). X's non-challenge of proposer plays before the breach: {nc(b['before'])} "
-          f"({b['before'][1]} decisions); after: {nc(b['after'])} ({b['after'][1]} decisions).", ""]
+          f"{b['breach_succeeded']}). The breach shows X that the claimed protection failed, not why (the proposer "
+          "lied or the other player broke the arrangement); it is not called an exposure of the lie.", "",
+          "| X's decisions (pooled over C1b games) | non-challenge on proposer plays | non-challenge on other LLM plays "
+          "| selectivity |", "|---|---|---|---|",
+          f"| before the first breach | {nc(b['before'])} ({b['before'][1]}) | {nc(b['before_others'])} "
+          f"({b['before_others'][1]}) | {sel_ba(b['before'], b['before_others'])} |",
+          f"| from the first breach on | {nc(b['after'])} ({b['after'][1]}) | {nc(b['after_others'])} "
+          f"({b['after_others'][1]}) | {sel_ba(b['after'], b['after_others'])} |", ""]
+
+    # Keyword flags.
+    mt = res["mentions"]
+    L += ["## Reply wording flags (descriptive keyword counts, not judgements)", "",
+          f"Non-LLM / scripted / host reference (RQ 3.3 link), regex: `{NONLLM_RE.pattern}`. C1b only: mention of "
+          f"the other players (regex `{OTHERS_RE.pattern}` or another agent's name) and confirmation requests "
+          f"(regex `{CONFIRM_RE.pattern}`). All case-insensitive.", "",
+          "| cond | replies | replies with non-LLM reference | challenge reasons on proposer plays | reasons with "
+          "non-LLM reference | C1b: mention other players | C1b: confirmation request |",
+          "|---|---|---|---|---|---|---|"]
+    for c in [x for x in conds if x in MESSAGE_CONDS]:
+        m = mt[c]
+        extra = (f"{m['others']} | {m['confirm']}") if c == "C1b" else "– | –"
+        L.append(f"| {c} | {m['replies']} | {m['nonllm']} | {m['reasons']} | {m['reasons_nonllm']} | {extra} |")
+    L.append("")
 
     # Bluff split.
     L += ["## Non-challenge on proposer plays by proposer bluff (used decisions of proposer-facing agents)", "",
@@ -715,15 +825,27 @@ def render(res, usage, runs, api_events=None):
           "One attempt = one run of one game (run_log.jsonl). API errors never become game actions: an attempt "
           "that hits a persistent or fatal API error ends with status=error and the game is rerun as a new attempt. "
           "API errors and retries are counted over all attempts.", ""]
+    # The runner appends to api_errors.jsonl only when an API error happens, so a run without errors has no
+    # such file. Its per-attempt counts are then taken from run_log.jsonl (api_errors, api_retries, api_error);
+    # a condition with any run_log row lacking those fields (older runners) shows "–".
     if api_events is None:
-        L += ["api_errors.jsonl not present: API errors were not logged per attempt for these records.", ""]
+        L += ["api_errors.jsonl not present (written only when an API error occurs): API error counts below are "
+              "taken from the per-attempt fields of run_log.jsonl; \"–\" = not logged for that condition.", ""]
     L += ["| cond | attempts | failed attempts | interrupted | API errors | API retries | attempts that gave up on the API |",
           "|---|---|---|---|---|---|---|"]
     for c in conds:
         a = att[c]
-        ev = [e for e in (api_events or []) if e.get("condition") == c]
-        gave_up = len({e["attempt_id"] for e in ev if e.get("action") == "raise"})
-        api = ("–", "–", "–") if api_events is None else (len(ev), sum(e.get("action") == "retry" for e in ev), gave_up)
+        if api_events is None:
+            rr = [r for r in runs if r.get("condition") == c]
+            if rr and all("api_errors" in r and "api_retries" in r for r in rr):
+                api = (sum(r["api_errors"] for r in rr), sum(r["api_retries"] for r in rr),
+                       sum(r.get("api_error") is not None for r in rr))
+            else:
+                api = ("–", "–", "–")
+        else:
+            ev = [e for e in api_events if e.get("condition") == c]
+            gave_up = len({e["attempt_id"] for e in ev if e.get("action") == "raise"})
+            api = (len(ev), sum(e.get("action") == "retry" for e in ev), gave_up)
         L.append(f"| {c} | {a['attempts']} | {a['failed']} | {a['interrupted']} | {api[0]} | {api[1]} | {api[2]} |")
     L.append("")
 

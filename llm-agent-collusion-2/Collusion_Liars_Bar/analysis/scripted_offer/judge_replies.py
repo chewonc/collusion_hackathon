@@ -18,9 +18,10 @@ Run from Collusion_Liars_Bar/ (the prompt file is next to this script):
 
 What the judge sees: the fixed rubric prompt (judge_prompt_v1.txt, byte-for-byte), the message body
 the agent received (the quoted text after the "Private message from ..." header line) and the
-reply text. It does NOT see the agent's ACCEPT/DECLINE label, agent name, model, condition code,
-game number or round. The message body identifies the condition, so the judge is not blind to it
-(disclosed in PREREG). Settings: temperature 0, top_p 1, fixed seed, max_tokens 150. One
+reply text. It does NOT see the agent's ACCEPT/DECLINE label, model, condition code, game number or
+round. The message body is shown as delivered, so it contains the agent's name in its salutation
+(and the reply may name the proposer). The message body identifies the condition, so the judge is
+not blind to it (disclosed in PREREG). Settings: temperature 0, top_p 1, fixed seed, max_tokens 150. One
 re-request on an unparseable answer; a second failure is recorded as `unparsed`.
 
 Requests go through the same local OpenAI-compatible router as the games (the `model` field selects
@@ -59,9 +60,15 @@ def sha(text):
 
 
 def offer_body(offer_text):
-    """The message as delivered, without the header line."""
-    parts = (offer_text or "").split("\n", 1)
-    return parts[1].strip() if len(parts) == 2 else (offer_text or "").strip()
+    """The message as delivered, without the "Private message from ..." header line.
+
+    Messages without that header (the C0 alliance notification of pilot 2) are kept whole.
+    """
+    text = (offer_text or "").strip()
+    parts = text.split("\n", 1)
+    if len(parts) == 2 and parts[0].startswith("Private message from"):
+        return parts[1].strip()
+    return text
 
 
 def build_prompt(template, offer, reply):
@@ -174,12 +181,12 @@ def items_from_records(records_dir):
 
 
 def items_from_pilot_records(records_dir):
-    """Pilot 2 replies (v5 wordings, C1-C3; C0 partner responses carry no v7 role and are skipped)."""
+    """The 60 pilot-2 replies (v5 wordings, C0-C3: 6 C0 alliance responses + 54 offer replies)."""
     items = []
     for p in sorted(Path(records_dir).glob("C*_g??.json")):
         rec = json.loads(p.read_text(encoding="utf-8"))
         so = rec["scripted_offer"]
-        if so["condition"] not in ("C1", "C2", "C3"):
+        if so["condition"] not in ("C0", "C1", "C2", "C3"):
             continue
         for o in so["offers"]:
             if o["decision"] in ("ACCEPT", "DECLINE") and isinstance(o.get("reply"), str):
@@ -275,6 +282,25 @@ def make_judge(args, settings):
 # ----------------------------------------------------------------------
 # Validation
 # ----------------------------------------------------------------------
+def load_reference(path):
+    """Optional reference labels (one person, pilot replies): columns condition, game_number, agent, round,
+    category. -> {(condition, game_number, agent, round): category}."""
+    with open(path, encoding="utf-8", newline="") as fh:
+        return {(r["condition"], int(r["game_number"]), r["agent"], int(r["round"])): r["category"].strip()
+                for r in csv.DictReader(fh)}
+
+
+def cohen_kappa(pairs):
+    """Cohen's kappa for [(label_a, label_b), ...]; None if undefined."""
+    n = len(pairs)
+    if not n:
+        return None
+    po = sum(a == b for a, b in pairs) / n
+    ca, cb = Counter(a for a, _ in pairs), Counter(b for _, b in pairs)
+    pe = sum(ca[k] * cb[k] for k in set(ca) | set(cb)) / (n * n)
+    return None if pe == 1 else (po - pe) / (1 - pe)
+
+
 def validate(args, judge, template, settings):
     out = Path(args.out_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -326,7 +352,14 @@ def validate(args, judge, template, settings):
          f"- Message hidden vs shown (run 1): {len(changed)} items change category:"]
     for k, shown, hid in changed:
         L.append(f"  - {k}: shown {shown} -> hidden {hid}")
-    L += [f"- Pilot-2 C2 replies labelled ACCEPT judged `committed`: {c2_committed}/{len(c2_accept)}", "",
+    L.append(f"- Pilot-2 C2 replies labelled ACCEPT judged `committed`: {c2_committed}/{len(c2_accept)}")
+    if args.reference:
+        ref = load_reference(args.reference)
+        pairs = [(ref[key(i)], runs[0][key(i)]) for i in pilot if key(i) in ref]
+        kappa = cohen_kappa(pairs)
+        L.append(f"- Optional reference labels ({args.reference}): {len(pairs)} pilot items matched; Cohen's kappa "
+                 f"vs run 1 = {'n/a' if kappa is None else f'{kappa:.3f}'} (reference value, not a pass criterion)")
+    L += ["",
           "## Synthetic items (run 1)", "", "| id | intended | judged | wary_no_commit |", "|---|---|---|---|"]
     for i, c in acc_items:
         L.append(f"| {i['agent']} | {i['intended']} | {c} | {int(i['wary_no_commit'])} |")
@@ -367,6 +400,8 @@ def main():
     v = sub.choices["validate"]
     v.add_argument("--pilot-records", default=None)
     v.add_argument("--synthetic", default=None)
+    v.add_argument("--reference", default=None,
+                   help="optional reference labels for the pilot replies (kappa is reported, never required)")
     v.add_argument("--out-dir", required=True)
     args = ap.parse_args()
 

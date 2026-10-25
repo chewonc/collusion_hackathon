@@ -46,7 +46,9 @@ Parallel mode (--workers K, K > 1): the same job queue, run by a pool of K proce
 maxtasksperchild=1, so every game runs in a fresh process (own global `random`, own module
 state, own stdout). Results are taken in completion order, so a game stuck in API backoff does
 not hold up the merging of games that finished. The parent is the only writer of the shared
-files. With --workers 1 the same steps run in this process, one game at a time.
+files. With --workers 1 the same steps run in this process, one game at a time; that serial mode
+is accepted only with --mock (offline tests; their default), so every real run is parallel
+(default --workers 10).
 
 Outputs (per game): <records-dir>/<cond>_g<NN>.json, <records-dir>/logs/<cond>_g<NN>.log, one
 line per attempt in <records-dir>/run_log.jsonl, one line per LLM call in usage.jsonl and one
@@ -70,7 +72,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
-DEFAULT_RESULTS = Path(r"C:\AISafetyResearch\Collusion\results\scripted_offer")
+DEFAULT_RESULTS = Path(r"X:\Collusion\results\scripted_offer")
 DEFAULT_RECORDS = ROOT / "experiments" / "game_records" / "scripted_offer"
 VERBATIM_FILES = [
     "prompts/scripted_offer/offer_direct.txt",
@@ -731,8 +733,9 @@ def main() -> int:
     ap.add_argument("--mock", action="store_true", help="offline: use MockLLMClient, no network")
     ap.add_argument("--mock-fault", default=None,
                     help="tests only, with --mock: COND:G:SITE:KIND[:N[:SKIP]] (see src/test/mock_llm.py)")
-    ap.add_argument("--workers", type=int, default=1,
-                    help="games run concurrently, one fresh process per game (1 = in this process)")
+    ap.add_argument("--workers", type=int, default=None,
+                    help="games run concurrently, one fresh process per game; real (non --mock) runs need >= 2 "
+                         "(1 = in this process, --mock only). Default: 10, or 1 with --mock")
     ap.add_argument("--warmup-routes", default=None,
                     help="routes.json of the model backends: wake all of them concurrently (direct, not via "
                          "the router; nothing is logged in the records) before the first game. Ignored with --mock.")
@@ -741,6 +744,10 @@ def main() -> int:
     args = ap.parse_args()
     if args.mock_fault and not args.mock:
         ap.error("--mock-fault requires --mock")
+    if args.workers is None:
+        args.workers = 1 if args.mock else 10
+    if args.workers < 2 and not args.mock:
+        ap.error("real runs are parallel only: --workers must be >= 2 (serial --workers 1 is allowed with --mock)")
 
     conditions = [c.strip() for c in args.conditions.split(",") if c.strip()]
     games = 1 if args.pilot else args.games

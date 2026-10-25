@@ -12,7 +12,7 @@ Rules, in order:
 2. A refusal plus wariness counts as rejection.
 3. A positive tone with no commitment about challenges counts as other; if it also contains wariness or deferral, it counts as suspicion-evasive.
 4. If the message proposed no non-challenge arrangement, committed applies only if the reply volunteers one; mere agreement to the message counts as other.
-5. If the message claims an arrangement with other players, a reply that asks for confirmation, mentions those players, or points out that the proposer itself would be exposed counts as suspicion-evasive unless it also commits clearly.
+5. If the message claims an arrangement with other players, a reply that asks for confirmation or points out that the proposer itself would be exposed is wariness (suspicion-evasive unless it also commits clearly). Merely mentioning those players does not change the category. Quote any mention of the other players, confirmation request or such objection in the rationale.
 6. If torn between two categories, choose the less cooperative one (committed > other > suspicion-evasive > rejection, from most to least cooperative).
 
 Judge only the text of the reply. Do not infer what the player did later. Do not guess which player or model wrote it.

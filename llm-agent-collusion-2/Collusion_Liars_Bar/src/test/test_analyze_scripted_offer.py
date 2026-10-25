@@ -130,6 +130,7 @@ def test_two_sided_stats():
     # Minimum attainable p for a Family A test at the first Holm step needs 8 game numbers.
     assert A.paired_test([0.1] * 7, threshold=0.05 / 6)["note"] and not A.paired_test([0.1] * 8, threshold=0.05 / 6)["note"]
     assert A.holm({"a": 0.01, "b": 0.04}) == {"a": 0.02, "b": 0.04}
+    assert A.holm({"a": 0.01, "b": 0.04}, m=6) == {"a": 0.06, "b": 0.2}
     print("ok two-sided sign-flip: symmetric in the sign, exact and Monte Carlo, smallest p 2/2^n; Holm; t-interval")
 
 
@@ -192,10 +193,11 @@ def test_family_a(res):
     assert t["HA2b"]["n"] == 2 and close(t["HA2b"]["mean"], -5 / 12) and close(t["HA2b"]["p"], 1.0), t["HA2b"]
     # HA2c: sel C1b - C1, g1 excluded -> one value 1/2 - 1/6 = 1/3.
     assert t["HA2c"]["n"] == 1 and close(t["HA2c"]["mean"], 1 / 3) and t["HA2c"]["p"] is None, t["HA2c"]
-    # Gatekeeping: gate failed -> HA2 not tested; judge validated and judgements present -> HA1 tested, Holm over 3.
+    # Gatekeeping: gate failed -> HA2 not tested; judge validated and judgements present -> HA1 tested; Holm keeps
+    # the family size at 6 (closed HA2 tests count as untested members).
     assert all(t[k]["tested"] for k in A.HA1) and not any(t[k]["tested"] for k in A.HA2)
     ps = {k: t[k]["p"] for k in A.HA1 if t[k]["p"] is not None}
-    assert {k: t[k]["p_holm"] for k in ps} == A.holm(ps)
+    assert {k: t[k]["p_holm"] for k in ps} == A.holm(ps, m=6)
     assert all(t[k]["p_holm"] is None and "gate not passed" in t[k]["note"] for k in A.HA2)
     print("ok Family A: HA1a/b shares, HA1c X-only with the dead-proposer exclusion, HA2a three-game table "
           "hand-checked with exact p over 9 labellings, HA2b/c, gatekeeping and Holm")
@@ -224,7 +226,11 @@ def test_hm(res):
 def test_descriptive(res):
     b = res["c1b"]
     assert b == {"games": 2, "with_breach": 1, "dead_proposer": 1, "before": [1, 1], "after": [0, 1],
+                 "before_others": [0, 0], "after_others": [0, 1],
                  "breach_rounds": [1], "breach_succeeded": 1}, b
+    # Per-model selectivity (all fixture agents have model "m"); keyword flags count every message-condition reply.
+    assert all(m == "m" for _, m in res["sel_by_model"]) and res["sel_by_model"][("C1b", "m")]["n"] == 1
+    assert res["mentions"]["C1b"]["replies"] == 2 and res["mentions"]["C1b"]["nonllm"] == 0
     c3 = res["c3_check"]
     # committed share C1 - C3: g0 1/3 - 1/3 = 0, g1 0 - 0 = 0.
     assert c3["n"] == 2 and close(c3["mean"], 0.0)
