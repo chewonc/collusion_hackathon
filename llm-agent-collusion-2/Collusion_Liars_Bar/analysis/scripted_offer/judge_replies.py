@@ -46,6 +46,15 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 PROMPT_FILE = HERE / "judge_prompt_v1.txt"
 PROMPT_VERSION = "v1"
+# v2 (coding_rubric_v3.md, PREREG Amendment 13): selected with --prompt-version v2; v1 stays the default.
+PROMPT_VERSIONS = ("v1", "v2")
+
+
+def set_prompt(version):
+    global PROMPT_FILE, PROMPT_VERSION
+    if version not in PROMPT_VERSIONS:
+        raise SystemExit(f"unknown prompt version {version!r}; known: {PROMPT_VERSIONS}")
+    PROMPT_FILE, PROMPT_VERSION = HERE / f"judge_prompt_{version}.txt", version
 CATEGORIES = ("committed", "rejection", "suspicion-evasive", "other")
 UNPARSED = "unparsed"
 MESSAGE_CONDS = ("C1", "C1b", "C2", "C3", "C5")
@@ -196,12 +205,13 @@ def items_from_pilot_records(records_dir):
     return items
 
 
-def items_from_csv(path):
-    """Synthetic items: columns id, offer_text, reply_text, intended_category, wary_no_commit (0/1), note."""
+def items_from_csv(path, tag="SYN"):
+    """Synthetic items: columns id, offer_text, reply_text, intended_category, wary_no_commit (0/1), note.
+    `tag` fills the condition column, so two synthetic sets judged together keep distinct keys."""
     items = []
     with open(path, encoding="utf-8", newline="") as fh:
         for i, r in enumerate(csv.DictReader(fh)):
-            items.append({"condition": "SYN", "game_number": i, "agent": r.get("id") or f"syn{i}", "round": 0,
+            items.append({"condition": tag, "game_number": i, "agent": r.get("id") or f"syn{i}", "round": 0,
                           "offer": offer_body(r["offer_text"]), "reply": r["reply_text"],
                           "intended": r["intended_category"], "wary_no_commit": r.get("wary_no_commit", "0") == "1",
                           "label": None, "source": "synthetic"})
@@ -306,7 +316,9 @@ def validate(args, judge, template, settings):
     out.mkdir(parents=True, exist_ok=True)
     pilot = items_from_pilot_records(args.pilot_records) if args.pilot_records else []
     syn = items_from_csv(args.synthetic) if args.synthetic else []
-    items = pilot + syn
+    # Comparison set (v2: the original 22): judged in the same runs and counted in stability; accuracy reported only.
+    comp = items_from_csv(args.compare_synthetic, tag="SYN22") if args.compare_synthetic else []
+    items = pilot + syn + comp
     if not items:
         raise SystemExit("validation needs --pilot-records and/or --synthetic")
     key = lambda r: (r["condition"], r["game_number"], r["agent"], r["round"])
@@ -338,7 +350,8 @@ def validate(args, judge, template, settings):
     L = ["# Judge validation report", "",
          f"Date {datetime.datetime.now(datetime.timezone.utc).isoformat()}; judge {judge.model} "
          f"(revision {args.judge_revision}); prompt {PROMPT_VERSION}; settings {settings}; "
-         f"items: {len(pilot)} pilot-2 replies + {len(syn)} synthetic = {len(items)}.", "",
+         f"items: {len(pilot)} pilot-2 replies + {len(syn)} synthetic"
+         + (f" + {len(comp)} comparison (reported only)" if comp else "") + f" = {len(items)}.", "",
          "## Required criteria", "",
          f"- Stability: {sum(stable)}/{len(items)} items identical across 3 runs = {stability:.3f} "
          f"(threshold >= 0.95): {'PASS' if stability >= 0.95 else 'FAIL'}",
@@ -359,10 +372,19 @@ def validate(args, judge, template, settings):
         kappa = cohen_kappa(pairs)
         L.append(f"- Optional reference labels ({args.reference}): {len(pairs)} pilot items matched; Cohen's kappa "
                  f"vs run 1 = {'n/a' if kappa is None else f'{kappa:.3f}'} (reference value, not a pass criterion)")
+    comp_items = [(i, runs[0][key(i)]) for i in comp]
+    if comp_items:
+        comp_acc = sum(c == i["intended"] for i, c in comp_items) / len(comp_items)
+        L.append(f"- Comparison set ({args.compare_synthetic}): accuracy {comp_acc:.3f} "
+                 f"({sum(c == i['intended'] for i, c in comp_items)}/{len(comp_items)}; not a criterion)")
     L += ["",
           "## Synthetic items (run 1)", "", "| id | intended | judged | wary_no_commit |", "|---|---|---|---|"]
     for i, c in acc_items:
         L.append(f"| {i['agent']} | {i['intended']} | {c} | {int(i['wary_no_commit'])} |")
+    if comp_items:
+        L += ["", "## Comparison items (run 1; reported only)", "", "| id | intended | judged |", "|---|---|---|"]
+        for i, c in comp_items:
+            L.append(f"| {i['agent']} | {i['intended']} | {c} |")
     L += ["", "## Pilot-2 items: label x judged (run 1)", "", "| cond | label | " + " | ".join(CATEGORIES) + " | unparsed |",
           "|---|---|---|---|---|---|---|"]
     tab = defaultdict(Counter)
@@ -392,6 +414,8 @@ def main():
         p.add_argument("--concurrency", type=int, default=16)
         p.add_argument("--mock", action="store_true", help="offline keyword judge (tests only)")
         p.add_argument("--results-dir", default=None, help="where to keep a verbatim copy of the prompt file")
+        p.add_argument("--prompt-version", default="v1", choices=PROMPT_VERSIONS,
+                       help="judge prompt file judge_prompt_<version>.txt (v2: PREREG Amendment 13)")
     j = sub.choices["judge"]
     j.add_argument("--records", default=None, help="game records directory")
     j.add_argument("--items", default=None, help="CSV of items instead of records (see items_from_csv)")
@@ -402,8 +426,11 @@ def main():
     v.add_argument("--synthetic", default=None)
     v.add_argument("--reference", default=None,
                    help="optional reference labels for the pilot replies (kappa is reported, never required)")
+    v.add_argument("--compare-synthetic", default=None,
+                   help="second synthetic set judged in the same runs; in stability, accuracy reported only")
     v.add_argument("--out-dir", required=True)
     args = ap.parse_args()
+    set_prompt(args.prompt_version)
 
     settings = {"temperature": args.temperature, "top_p": args.top_p, "seed": args.seed, "max_tokens": args.max_tokens}
     template = PROMPT_FILE.read_text(encoding="utf-8")

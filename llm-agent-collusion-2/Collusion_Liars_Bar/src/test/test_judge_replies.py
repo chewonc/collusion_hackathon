@@ -75,6 +75,67 @@ def test_mock_validation():
           "exit code matches the verdict")
 
 
+RUBRIC_V3 = Path(r"X:\Collusion\results\scripted_offer\coding_rubric_v3.md")
+JUDGE_V2 = Path(r"X:\Collusion\results\scripted_offer\judge_v2")
+
+
+def test_prompt_v2_and_freeze():
+    """Amendment 13: prompt v2 equals rubric v3 section 3; --prompt-version v2 and --compare-synthetic work;
+    the freeze script refuses edited sheets, builds the agreed set and a manifest (on a temporary copy only)."""
+    import re
+    import shutil
+    v2 = (J.HERE / "judge_prompt_v2.txt").read_text(encoding="utf-8")
+    block = re.search(r"## 3\. Judge prompt v2.*?\n```\n(.*?)\n```", RUBRIC_V3.read_text(encoding="utf-8"), re.S).group(1)
+    assert block == v2.rstrip("\n"), "judge_prompt_v2.txt must equal coding_rubric_v3.md section 3"
+    assert v2 != (J.HERE / "judge_prompt_v1.txt").read_text(encoding="utf-8")
+    items = list(csv.DictReader(open(JUDGE_V2 / "items.csv", encoding="utf-8")))
+    old = {r["reply_text"].lower() for r in csv.DictReader(open(SYN, encoding="utf-8"))}
+    assert len(items) == 40 and not old & {r["reply_text"].lower() for r in items}
+    for phrase in ("i'll pick mine carefully", "i don't buy it", "not agreeing to anything"):
+        assert phrase not in v2.lower(), f"prompt v2 must not reuse a v1 validation item's wording: {phrase}"
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        shutil.copy(RUBRIC_V3, root / "coding_rubric_v3.md")
+        d = root / "judge_v2"
+        shutil.copytree(JUDGE_V2, d, ignore=shutil.ignore_patterns("freeze_manifest.json", "validation_set_v2.csv",
+                                                                      "disagreements.csv", "freeze_report.md"))
+        freeze = [PY, "-I", str(d / "freeze_judge_v2.py")]
+        env = {**os.environ, "PYTHONUTF8": "1"}
+        assert subprocess.run(freeze, capture_output=True, text=True, env=env).returncode != 0, "blank sheets must not freeze"
+        cats = J.CATEGORIES
+        for name, flip in (("labels_A.csv", set()), ("labels_B.csv", {"V03", "V18", "V35"})):
+            rows = list(csv.DictReader(open(d / name, encoding="utf-8")))
+            for k, r in enumerate(rows):
+                r["category"] = cats[(k + (r["id"] in flip)) % 4]
+            with open(d / name, "w", encoding="utf-8", newline="") as fh:
+                w = csv.DictWriter(fh, fieldnames=list(rows[0]))
+                w.writeheader()
+                w.writerows(rows)
+        out = subprocess.run(freeze, capture_output=True, text=True, env=env)
+        assert out.returncode == 0, out.stdout + out.stderr
+        m = json.loads((d / "freeze_manifest.json").read_text(encoding="utf-8"))
+        assert m["status"] == "ok" and m["n_agreed"] == 37 and "labels_B.csv" in m["sha256"]
+        agreed = J.items_from_csv(d / "validation_set_v2.csv")
+        assert len(agreed) == 37 and all(i["intended"] in cats for i in agreed)
+        assert subprocess.run(freeze, capture_output=True, text=True, env=env).returncode != 0, "a second freeze must refuse"
+        # validate with prompt v2: new set = criterion, original 22 = comparison (reported only, counted in stability)
+        vout = root / "vout"
+        cmd = [PY, "analysis/scripted_offer/judge_replies.py", "validate", "--mock", "--prompt-version", "v2",
+               "--synthetic", str(d / "validation_set_v2.csv"), "--compare-synthetic", str(SYN),
+               "--out-dir", str(vout), "--results-dir", str(vout)]
+        res = subprocess.run(cmd, capture_output=True, text=True, env=env)
+        report = (vout / "judge_validation_report.md").read_text(encoding="utf-8")
+        assert ("**Overall: PASS**" in report) == (res.returncode == 0)
+        assert "prompt v2" in report and "comparison (reported only)" in report and "not a criterion" in report
+        assert f"{37 + 22}/{37 + 22} items identical" in report, "stability counts both synthetic sets"
+        rows = list(csv.DictReader(open(vout / "judgements_validation_run1.csv", encoding="utf-8")))
+        assert len(rows) == 59 and {r["prompt_version"] for r in rows} == {"v2"}
+        assert {r["condition"] for r in rows} == {"SYN", "SYN22"}
+        assert (vout / "judge_prompt_v2.txt").read_bytes() == (J.HERE / "judge_prompt_v2.txt").read_bytes()
+    print("ok v2: prompt equals rubric v3; no reuse of v1 item wording; freeze refuses blank/second runs and builds "
+          "the agreed set; validate v2 uses the new set as criterion and the 22 as comparison")
+
+
 def test_pilot_items():
     """The validation sample is the 60 pilot-2 replies, C0-C3 (C0 6 + C1/C2/C3 18 each)."""
     items = J.items_from_pilot_records(PILOT2)
@@ -146,6 +207,7 @@ def test_mock_records_and_unparsed():
 if __name__ == "__main__":
     test_prompt_and_parser()
     test_mock_validation()
+    test_prompt_v2_and_freeze()
     test_pilot_items()
     test_mock_records_and_unparsed()
     print("ALL JUDGE CHECKS PASSED")
