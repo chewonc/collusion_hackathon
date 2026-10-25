@@ -81,7 +81,8 @@ JUDGE_V2 = Path(r"X:\Collusion\results\scripted_offer\judge_v2")
 
 def test_prompt_v2_and_freeze():
     """Amendment 13: prompt v2 equals rubric v3 section 3; --prompt-version v2 and --compare-synthetic work;
-    the freeze script refuses edited sheets, builds the agreed set and a manifest (on a temporary copy only)."""
+    the freeze script checks the seal hashes, builds the 40-item set from the sealed intended labels and a
+    manifest (on a temporary copy only)."""
     import re
     import shutil
     v2 = (J.HERE / "judge_prompt_v2.txt").read_text(encoding="utf-8")
@@ -99,24 +100,23 @@ def test_prompt_v2_and_freeze():
         d = root / "judge_v2"
         shutil.copytree(JUDGE_V2, d, ignore=shutil.ignore_patterns("freeze_manifest.json", "validation_set_v2.csv",
                                                                       "disagreements.csv", "freeze_report.md"))
-        freeze = [PY, "-I", str(d / "freeze_judge_v2.py")]
+        import hashlib
         env = {**os.environ, "PYTHONUTF8": "1"}
-        assert subprocess.run(freeze, capture_output=True, text=True, env=env).returncode != 0, "blank sheets must not freeze"
-        cats = J.CATEGORIES
-        for name, flip in (("labels_A.csv", set()), ("labels_B.csv", {"V03", "V18", "V35"})):
-            rows = list(csv.DictReader(open(d / name, encoding="utf-8")))
-            for k, r in enumerate(rows):
-                r["category"] = cats[(k + (r["id"] in flip)) % 4]
-            with open(d / name, "w", encoding="utf-8", newline="") as fh:
-                w = csv.DictWriter(fh, fieldnames=list(rows[0]))
-                w.writeheader()
-                w.writerows(rows)
+        prereg = root / "PREREG.md"
+        freeze = [PY, "-I", str(d / "freeze_judge_v2.py"), str(prereg)]
+        prereg.write_text("no seal recorded\n", encoding="utf-8")
+        assert subprocess.run(freeze, capture_output=True, text=True, env=env).returncode != 0, "unsealed files must not freeze"
+        seal = [hashlib.sha256((d / n).read_bytes()).hexdigest() for n in ("items.csv", "design_SEALED.csv", "make_items.py")]
+        prereg.write_text("seal: " + " ".join(seal) + "\n", encoding="utf-8")
         out = subprocess.run(freeze, capture_output=True, text=True, env=env)
         assert out.returncode == 0, out.stdout + out.stderr
         m = json.loads((d / "freeze_manifest.json").read_text(encoding="utf-8"))
-        assert m["status"] == "ok" and m["n_agreed"] == 37 and "labels_B.csv" in m["sha256"]
+        assert m["status"] == "ok" and m["n_items"] == 40 and "design_SEALED.csv" in m["sha256"]
+        assert not any(n.startswith("labels_") for n in m["sha256"]), "no human label files (no human coding)"
         agreed = J.items_from_csv(d / "validation_set_v2.csv")
-        assert len(agreed) == 37 and all(i["intended"] in cats for i in agreed)
+        design = {r["id"]: r["author_expected_category"] for r in csv.DictReader(open(d / "design_SEALED.csv", encoding="utf-8"))}
+        assert len(agreed) == 40 and all(i["intended"] == design[i["agent"]] for i in agreed)
+        assert {i["agent"] for i in agreed if i["wary_no_commit"]} == {k for k, v in design.items() if v == "suspicion-evasive"}
         assert subprocess.run(freeze, capture_output=True, text=True, env=env).returncode != 0, "a second freeze must refuse"
         # validate with prompt v2: new set = criterion, original 22 = comparison (reported only, counted in stability)
         vout = root / "vout"
@@ -127,13 +127,13 @@ def test_prompt_v2_and_freeze():
         report = (vout / "judge_validation_report.md").read_text(encoding="utf-8")
         assert ("**Overall: PASS**" in report) == (res.returncode == 0)
         assert "prompt v2" in report and "comparison (reported only)" in report and "not a criterion" in report
-        assert f"{37 + 22}/{37 + 22} items identical" in report, "stability counts both synthetic sets"
+        assert f"{40 + 22}/{40 + 22} items identical" in report, "stability counts both synthetic sets"
         rows = list(csv.DictReader(open(vout / "judgements_validation_run1.csv", encoding="utf-8")))
-        assert len(rows) == 59 and {r["prompt_version"] for r in rows} == {"v2"}
+        assert len(rows) == 62 and {r["prompt_version"] for r in rows} == {"v2"}
         assert {r["condition"] for r in rows} == {"SYN", "SYN22"}
         assert (vout / "judge_prompt_v2.txt").read_bytes() == (J.HERE / "judge_prompt_v2.txt").read_bytes()
-    print("ok v2: prompt equals rubric v3; no reuse of v1 item wording; freeze refuses blank/second runs and builds "
-          "the agreed set; validate v2 uses the new set as criterion and the 22 as comparison")
+    print("ok v2: prompt equals rubric v3; no reuse of v1 item wording; freeze refuses unsealed/second runs and builds "
+          "the 40-item set from the sealed intended labels; validate v2 uses it as criterion and the 22 as comparison")
 
 
 def test_pilot_items():
