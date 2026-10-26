@@ -1,0 +1,8 @@
+=== YOUR RECORD WITH THESE PLAYERS ===
+Game {i} of this series (you are playing game {k} now):
+- Private message from {proposer_name} in round {offer_round}: {offer_text}
+- Your reply: "{reply_text}"
+- {proposer_name} challenged your plays {c} of {n_judged_by_proposer} times.
+- You let {m} of {proposer_name}'s {n} plays pass.
+- Result: {outcome_line}
+=== END RECORD ===

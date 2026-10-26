@@ -80,6 +80,11 @@ VERBATIM_FILES = [
     "prompts/scripted_offer/offer_benign.txt",
     "prompts/scripted_offer/offer_broker.txt",
     "prompts/scripted_offer/offer_placebo.txt",
+    # Family B (Amendment 14)
+    "prompts/scripted_offer/offer_consistency.txt",
+    "prompts/scripted_offer/offer_consistency_instruct.txt",
+    "prompts/scripted_offer/offer_authority.txt",
+    "prompts/scripted_offer/series_memory_block.txt",
     "prompts/scripted_offer/response_prompt.txt",
     "prompts/scripted_offer/private_messages_block.txt",
     "prompts/secret_channel/partner_notification_prompt.txt",
@@ -95,7 +100,7 @@ EXIT_WARMUP = 4
 # so they appear in no record, usage row or router log; they change nothing a model sees in a game.
 DEFAULT_WARMUP_SCRIPT = ROOT.parents[2] / "experiments" / "modal_infra" / "warmup.py"
 STREAM_FILES = {"usage": "usage.jsonl", "api_error": "api_errors.jsonl"}
-AID_RE = re.compile(r"^(C\d[a-z]?)_g(\d+)_a(\d+)$")
+AID_RE = re.compile(r"^(C\d[a-z]*)_g(\d+)_a(\d+)$")   # [a-z]* : C1b, C1c, C1ci, C1d, C1s
 
 # Per-process state of the game being run (one game per process at a time).
 _usage_ctx = {"condition": None, "game_number": None, "attempt_id": None, "usage_file": None,
@@ -118,6 +123,75 @@ def execution_order(conditions, game_number):
 
 def attempt_id(cond: str, g: int, n: int) -> str:
     return f"{cond}_g{g:02d}_a{n}"
+
+
+# ----------------------------------------------------------------------
+# HB1 series (PREREG Amendment 14): k consecutive games per game number, true memory from game 2 on
+# ----------------------------------------------------------------------
+SERIES_SEED_STEP = 1000   # game i of a series uses seed g + (i - 1) * SERIES_SEED_STEP
+
+
+def series_seed(g: int, i: int) -> int:
+    return g + (i - 1) * SERIES_SEED_STEP
+
+
+def record_name(cond: str, g: int, series: int = 1, i: int = None) -> str:
+    """<cond>_gNN.json, or <cond>_gNN_kI.json for game I of a k-game series (I = k when omitted)."""
+    if series > 1:
+        return f"{cond}_g{g:02d}_k{series if i is None else i}.json"
+    return f"{cond}_g{g:02d}.json"
+
+
+def build_memory_block(records: list, agent: str, k_now: int, template: str) -> str:
+    """The memory text an agent carries into game `k_now` of a series: one filled copy of the
+    frozen template per earlier game, every number counted from that game's record.
+
+    Lines for the private message and the agent's reply appear only for a game in which the agent
+    received a message (game 1); otherwise a single line says that no message was received. Nothing
+    is invented: `c` is the number of times the proposer challenged this agent's plays (the proposer
+    never challenges, so it is 0), `n_judged_by_proposer` the number of this agent's plays the
+    proposer was the judging seat for, `m`/`n` the agent's own non-challenges / decisions on the
+    proposer's plays, and the result line names the winner and whether the agent survived.
+    """
+    blocks = []
+    for i, rec in enumerate(records, start=1):
+        so = rec["scripted_offer"]
+        proposer = so["proposer"]
+        offer = next((o for o in so["offers"] if o["agent"] == agent), None)
+        dec = so["decisions"]
+        judged = [d for d in dec if d["challenger"] == proposer and d["current_player"] == agent]
+        own = [d for d in dec if d["challenger"] == agent and d["is_proposer_play"]]
+        c = sum(1 for d in judged if d["was_challenged"])
+        m = sum(1 for d in own if not d["was_challenged"])
+        winner = rec.get("winner")
+        last_players = rec["rounds"][-1]["round_players"] if rec.get("rounds") else []
+        survived = agent in last_players
+        outcome = (f"{winner} won the game; " if winner else "no winner recorded; ") + \
+                  ("you were the winner. " if winner == agent else
+                   ("you survived to the end. " if survived else "you were eliminated. ")) + \
+                  "Final scores: " + ", ".join(f"{k} {v}" for k, v in (rec.get("final_scores") or {}).items()) + "."
+        text = template
+        if offer is not None:
+            reply = offer["reply"] if offer["reply"] else " ".join((offer["raw_response"] or "").split()[:50])
+            # The message body only: the delivered text starts with the shared header line
+            # "Private message from <proposer> (only you can see it):", which the record line already says.
+            body = offer["offer_text"].split("\n", 1)[1].strip() if "\n" in offer["offer_text"] else offer["offer_text"]
+            text = (text.replace("{offer_round}", str(offer["round"]))
+                        .replace("{offer_text}", body)
+                        .replace("{reply_text}", reply or "(no reply)"))
+        else:
+            lines = [ln for ln in text.split("\n")
+                     if "{offer_text}" not in ln and "{reply_text}" not in ln]
+            idx = next(j for j, ln in enumerate(lines) if ln.startswith("- "))
+            lines.insert(idx, "- No private message from {proposer_name} in this game.")
+            text = "\n".join(lines)
+        text = (text.replace("{i}", str(i)).replace("{k}", str(k_now))
+                    .replace("{proposer_name}", proposer)
+                    .replace("{c}", str(c)).replace("{n_judged_by_proposer}", str(len(judged)))
+                    .replace("{m}", str(m)).replace("{n}", str(len(own)))
+                    .replace("{outcome_line}", outcome))
+        blocks.append(text.strip("\n"))
+    return "\n\n" + "\n\n".join(blocks) + "\n"
 
 
 def parse_attempt_id(aid):
@@ -331,8 +405,9 @@ class SharedState:
     """What the parent knows about the records directory: used attempt numbers, logged attempts and
     merged event keys. Valid because only the lock holder writes to the directory."""
 
-    def __init__(self, records_dir: Path):
+    def __init__(self, records_dir: Path, series: int = 1):
         self.records_dir = records_dir
+        self.series = series
         self.max_attempt = defaultdict(int)
         self.logged = set()
         legacy = defaultdict(int)
@@ -427,24 +502,35 @@ def preserve_old_log(records_dir: Path, cond: str, g: int) -> None:
     os.rename(log, target)
 
 
-def _merge_record(records_dir: Path, adir: Path, cond: str, g: int, aid=None):
-    """Move an attempt's record into records_dir after checking it. Returns an error message or None."""
-    name = f"{cond}_g{g:02d}.json"
-    src, dst = adir / name, records_dir / name
-    if not src.exists():
-        return f"record missing: {src}"
-    try:
-        rec = json.loads(src.read_text(encoding="utf-8"))
-        so = rec["scripted_offer"]
-    except Exception as e:
-        return f"record unreadable: {src}: {e!r}"
-    if (so.get("condition"), so.get("game_number"), so.get("seed")) != (cond, g, g):
-        return f"record mismatch: {src} has {(so.get('condition'), so.get('game_number'), so.get('seed'))}"
-    if aid is not None and so.get("attempt_id") != aid:
-        return f"record mismatch: {src} has attempt_id {so.get('attempt_id')!r}, expected {aid!r}"
-    if dst.exists():
-        return f"duplicate record: {dst} already exists"
-    os.replace(src, dst)
+def _merge_record(records_dir: Path, adir: Path, cond: str, g: int, aid=None, series: int = 1):
+    """Move an attempt's record(s) into records_dir after checking them. Returns an error message or None.
+
+    A series attempt has `series` records (game 1..k); all are checked before any is moved, and a
+    series is merged only as a whole.
+    """
+    moves = []
+    for i in range(1, series + 1):
+        name = record_name(cond, g, series, i)
+        src, dst = adir / name, records_dir / name
+        if not src.exists():
+            return f"record missing: {src}"
+        try:
+            rec = json.loads(src.read_text(encoding="utf-8"))
+            so = rec["scripted_offer"]
+        except Exception as e:
+            return f"record unreadable: {src}: {e!r}"
+        expected = (cond, g, series_seed(g, i) if series > 1 else g)
+        if (so.get("condition"), so.get("game_number"), so.get("seed")) != expected:
+            return f"record mismatch: {src} has {(so.get('condition'), so.get('game_number'), so.get('seed'))}"
+        if series > 1 and (so.get("series") or {}).get("index") != i:
+            return f"record mismatch: {src} is not game {i} of the series"
+        if aid is not None and so.get("attempt_id") != aid:
+            return f"record mismatch: {src} has attempt_id {so.get('attempt_id')!r}, expected {aid!r}"
+        if dst.exists():
+            return f"duplicate record: {dst} already exists"
+        moves.append((src, dst))
+    for src, dst in moves:
+        os.replace(src, dst)
     return None
 
 
@@ -504,7 +590,7 @@ def finish_attempt(state: SharedState, line: dict) -> dict:
     adir, aid = Path(line.pop("attempt_dir")), line["attempt_id"]
     cond, g = line["condition"], line["game_number"]
     if line["status"] == "ok":
-        problem = _merge_record(state.records_dir, adir, cond, g, aid)
+        problem = _merge_record(state.records_dir, adir, cond, g, aid, state.series)
         if problem:
             line["status"], line["error"] = "error", problem
     _maybe_crash("after_record_merge", aid)
@@ -540,7 +626,7 @@ def recover_attempts(state: SharedState):
             print(f"WARNING: {aid} is still running in another process; left in place, game not queued")
             busy.add((cond, g))
             continue
-        rec_path = state.records_dir / f"{cond}_g{g:02d}.json"
+        rec_path = state.records_dir / record_name(cond, g, state.series)
         recovered_ok = False
         if rec_path.exists():
             try:
@@ -590,11 +676,31 @@ def run_attempt(job: dict) -> dict:
                 contextlib.redirect_stderr(log):
             print(f"# attempt_id={aid}")
             try:
-                game = GameScriptedOffer(cond, g, seed=g, out_dir=str(adir), offer_round=opts["offer_round"],
-                                         bluff_prob=opts["bluff_prob"], attempt_id=aid)
-                # Upstream GameRecord auto-saves to a second-resolution timestamp name; keep it per attempt.
-                game.game_record.save_directory = str(adir)
-                record = game.start_game()
+                series = int(opts.get("series") or 1)
+                if series == 1:
+                    game = GameScriptedOffer(cond, g, seed=g, out_dir=str(adir), offer_round=opts["offer_round"],
+                                             bluff_prob=opts["bluff_prob"], attempt_id=aid)
+                    # Upstream GameRecord auto-saves to a second-resolution timestamp name; keep it per attempt.
+                    game.game_record.save_directory = str(adir)
+                    record = game.start_game()
+                else:
+                    # HB1 series: games 1..k in this process, one after the other. Game i > 1 carries a
+                    # memory block per agent built from the records of games 1..i-1 of this attempt.
+                    from src.game.game_scripted_offer import AGENT_CONFIGS, SERIES_MEMORY_TEMPLATE
+                    from src.utils.prompt_loader import PromptLoader
+                    template = PromptLoader.load_prompt(SERIES_MEMORY_TEMPLATE)
+                    earlier = []
+                    for i in range(1, series + 1):
+                        memory = ({c["name"]: build_memory_block(earlier, c["name"], i, template)
+                                   for c in AGENT_CONFIGS} if i > 1 else None)
+                        print(f"# series game {i}/{series}, seed {series_seed(g, i)}")
+                        game = GameScriptedOffer(cond, g, seed=series_seed(g, i), out_dir=str(adir),
+                                                 offer_round=opts["offer_round"], bluff_prob=opts["bluff_prob"],
+                                                 attempt_id=aid, series_index=i, series_games=series,
+                                                 memory_blocks=memory)
+                        game.game_record.save_directory = str(adir)
+                        record = game.start_game()
+                        earlier.append(record)
             except Exception:
                 status, err = "error", traceback.format_exc()
                 print(err)
@@ -622,7 +728,7 @@ def build_jobs(state: SharedState, conditions, games: int, busy, opts):
     for g in range(games):
         order = execution_order(conditions, g)
         for position, cond in enumerate(order):
-            name = f"{cond}_g{g:02d}.json"
+            name = record_name(cond, g, state.series)
             if (state.records_dir / name).exists():
                 print(f"skip {name} (exists)")
                 continue
@@ -724,6 +830,9 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="Scripted-offer experiment runner")
     ap.add_argument("--conditions", default="C0,C1,C1b,C2,C3,C4,C5")
     ap.add_argument("--games", type=int, default=12, help="game numbers 0..games-1 per condition")
+    ap.add_argument("--series", type=int, default=1,
+                    help="HB1 only (--conditions C1s): k consecutive games per game number with true memory "
+                         "from game 2 on; records <cond>_gNN_kI.json. Default 1 = single games.")
     ap.add_argument("--pilot", action="store_true", help="one game (game number 0) per condition")
     ap.add_argument("--offer-round", type=int, default=2)
     ap.add_argument("--bluff-prob", type=float, default=0.5)
@@ -750,6 +859,12 @@ def main() -> int:
         ap.error("real runs are parallel only: --workers must be >= 2 (serial --workers 1 is allowed with --mock)")
 
     conditions = [c.strip() for c in args.conditions.split(",") if c.strip()]
+    if args.series < 1:
+        ap.error("--series must be >= 1")
+    if args.series > 1 and conditions != ["C1s"]:
+        ap.error("--series is defined for --conditions C1s only (one condition per records directory)")
+    if args.series == 1 and "C1s" in conditions:
+        ap.error("C1s needs --series k (k >= 2)")
     games = 1 if args.pilot else args.games
     records_dir = Path(args.records_dir).resolve()   # games chdir to ROOT
     (records_dir / "logs").mkdir(parents=True, exist_ok=True)
@@ -763,11 +878,11 @@ def main() -> int:
             return EXIT_WARMUP
         print("warm-up complete: every backend answered", flush=True)
 
-    state = SharedState(records_dir)
+    state = SharedState(records_dir, series=args.series)
     busy = recover_attempts(state)
     opts = {"records_dir": str(records_dir), "mock": args.mock, "mock_fault": args.mock_fault,
             "router": args.router, "offer_round": args.offer_round, "bluff_prob": args.bluff_prob,
-            "workers": args.workers}
+            "workers": args.workers, "series": args.series}
     jobs = build_jobs(state, conditions, games, busy, opts)
     failures = run_jobs(state, jobs, args.workers)
     return 1 if failures or busy else 0

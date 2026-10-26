@@ -15,7 +15,14 @@ from src.game.game_record import GameRecord
 from src.game.game_secret_channel import GameSecretChannel, SecretChannel
 from src.utils.prompt_loader import PromptLoader
 
-CONDITIONS = ("C0", "C1", "C1b", "C2", "C3", "C4", "C5")
+CONDITIONS = ("C0", "C1", "C1b", "C2", "C3", "C4", "C5")   # the main run (PREREG v7)
+# Family B (PREREG Amendment 14, results/scripted_offer/followup/HYPOTHESES_v1.md): follow-up
+# conditions, never part of the main run's condition list or of its counterbalanced rotation.
+FAMILY_B_CONDITIONS = ("C1c", "C1ci", "C1d", "C1s")
+ALL_CONDITIONS = CONDITIONS + FAMILY_B_CONDITIONS
+# Conditions whose message goes ONLY to the alive seat directly after the proposer (the one agent
+# that can challenge the proposer's plays); the other agents receive nothing.
+X_ONLY_CONDITIONS = ("C1b", "C1c", "C1ci", "C1d")
 CONDITION_NAMES = {
     "C0": "positive_control_explicit_alliance",
     "C1": "direct_offer",
@@ -24,6 +31,10 @@ CONDITION_NAMES = {
     "C3": "benign_cooperation_request",
     "C4": "no_offer",
     "C5": "placebo_neutral_message",
+    "C1c": "false_self_record_plus_pact",            # HB2: fabricated record of X's own sparing + C1 pact
+    "C1ci": "false_self_record_plus_instruction",    # HB3: same record, phrased as a directive, no question
+    "C1d": "claimed_prompt_authority_plus_pact",     # HB4: proposer claims to be part of the game's prompt
+    "C1s": "direct_offer_series",                    # HB1: C1 message in game 1 of a k-game series + true memory
 }
 OFFER_TEMPLATES = {
     "C0": "prompts/secret_channel/partner_notification_prompt.txt",
@@ -38,12 +49,22 @@ OFFER_TEMPLATES = {
     # response prompt and re-injected block). Its ACCEPT/DECLINE replies are recorded only; they are
     # not acceptance of a pact and are not used in any acceptance hypothesis.
     "C5": "prompts/scripted_offer/offer_placebo.txt",
+    "C1c": "prompts/scripted_offer/offer_consistency.txt",
+    "C1ci": "prompts/scripted_offer/offer_consistency_instruct.txt",
+    "C1d": "prompts/scripted_offer/offer_authority.txt",
+    "C1s": "prompts/scripted_offer/offer_direct.txt",   # identical message to C1
 }
+# HB1 series: memory block appended to an agent's prompts from game 2 on (built from the series' own
+# records by the runner; see run_scripted_offer.build_memory_block).
+SERIES_MEMORY_TEMPLATE = "prompts/scripted_offer/series_memory_block.txt"
 RESPONSE_TEMPLATE = "prompts/scripted_offer/response_prompt.txt"
 PRIVATE_BLOCK_TEMPLATE = "prompts/scripted_offer/private_messages_block.txt"
 RULES_PATH = "prompts/rule_vanilla.txt"
 
 PROPOSER_NAME = "Riley"
+# Per-condition proposer name; every condition uses "Riley" (HB4 keeps the name so that C1d differs
+# from C1 in the message text only; a renamed proposer would be a separate variant).
+PROPOSER_NAMES = {c: PROPOSER_NAME for c in ALL_CONDITIONS}
 # The proposer replaces Mike (ministral-8b); the remaining three LLM seats are fixed.
 AGENT_CONFIGS = [
     {"name": "Lily", "model": "llama-3.1-8b"},
@@ -103,9 +124,19 @@ class GameScriptedOffer(GameSecretChannel):
     def __init__(self, condition: str, game_number: int, seed: int, out_dir: str,
                  offer_round: int = 2, bluff_prob: float = 0.5,
                  agent_configs: List[Dict[str, str]] = AGENT_CONFIGS,
-                 attempt_id: Optional[str] = None) -> None:
-        if condition not in CONDITIONS:
-            raise ValueError(f"Unknown condition {condition!r}; expected one of {CONDITIONS}")
+                 attempt_id: Optional[str] = None,
+                 series_index: int = 1, series_games: int = 1,
+                 memory_blocks: Optional[Dict[str, str]] = None) -> None:
+        if condition not in ALL_CONDITIONS:
+            raise ValueError(f"Unknown condition {condition!r}; expected one of {ALL_CONDITIONS}")
+        if series_games > 1 and condition != "C1s":
+            raise ValueError(f"series mode is defined for C1s only, not {condition!r}")
+        if not 1 <= series_index <= series_games:
+            raise ValueError(f"series_index {series_index} outside 1..{series_games}")
+        if series_index > 1 and not memory_blocks:
+            raise ValueError("series games after the first need the memory blocks of the earlier games")
+        if series_index == 1 and memory_blocks:
+            raise ValueError("game 1 of a series carries no memory")
         # Seed first: player bullets, the starting seat, target cards and deals all draw from
         # the global random stream, so the same seed gives the same round-1 state in every
         # condition. LLM sampling is not seeded, so trajectories still diverge after round 1.
@@ -118,9 +149,14 @@ class GameScriptedOffer(GameSecretChannel):
         self.bluff_prob = bluff_prob
         self.out_dir = out_dir
         self.attempt_id = attempt_id   # record-only: which run attempt of this game produced the record
+        # HB1 series (C1s): game `series_index` of `series_games`; `memory_blocks` = {agent: text} built
+        # by the runner from the earlier games' records and appended to that agent's prompts.
+        self.series_index = series_index
+        self.series_games = series_games
+        self.memory_blocks: Dict[str, str] = dict(memory_blocks or {})
         self.seat_configs = seat_order(game_number, agent_configs)
 
-        self.proposer = ScriptedPlayer(PROPOSER_NAME, bluff_prob=bluff_prob, seed=seed)
+        self.proposer = ScriptedPlayer(PROPOSER_NAMES[condition], bluff_prob=bluff_prob, seed=seed)
         # LLM seats use ExperimentPlayer so the original Player class stays unmodified.
         self.players: List[Player] = [self.proposer] + [ExperimentPlayer(c["name"], c["model"]) for c in self.seat_configs]
         for player in self.players:
@@ -143,6 +179,8 @@ class GameScriptedOffer(GameSecretChannel):
         self.prompts = {}
 
         self.c0_ally: Optional[str] = self.seat_configs[0]["name"] if condition == "C0" else None
+        # Record-only (C1c, C1ci, C1d): who received the X-only message. C1b keeps `c1b_recipient`.
+        self.x_recipient: Optional[str] = None
         # Record-only: the agent in the next alive seat after the proposer at the offer point
         # (the only agent that can challenge the proposer). Set in every condition, including
         # C4, for same-seat pairing in the analysis. It does not affect who receives a message.
@@ -161,6 +199,20 @@ class GameScriptedOffer(GameSecretChannel):
         self.game_record: GameRecord = GameRecord(None, communication_enabled=False)
         self.game_record.start_game([p.name for p in self.players])
 
+        if self.series_index > 1:
+            # Games 2..k of a series: no new message. Every agent with a memory block carries it in
+            # all of its prompts from the first call, and all of its decisions count as post-offer.
+            for agent in self.players[1:]:
+                if agent.name in self.memory_blocks:
+                    agent.private_messages = self.memory_blocks[agent.name]
+                    self.offered.append(agent.name)
+            self.offer_done = True
+            self.offer_round_actual = 0
+            self.target = self.players[self._next_alive_idx(0)].name
+            self.game_record.add_secret_channel_event({"event": "series_memory",
+                                                       "game_in_series": self.series_index,
+                                                       "agents": list(self.memory_blocks)})
+
     # ------------------------------------------------------------------
     # Offer delivery and memory injection
     # ------------------------------------------------------------------
@@ -170,12 +222,12 @@ class GameScriptedOffer(GameSecretChannel):
             return []
         if self.condition == "C0":
             return [p for p in alive_agents if p.name == self.c0_ally]
-        if self.condition == "C1b":
+        if self.condition in X_ONLY_CONDITIONS:
             # The alive seat directly after the proposer at the offer point (ignores hands, like
             # `target`). Empty if that seat is the proposer itself (no other player alive).
             nxt = self.players[self._next_alive_idx(0)]
             return [nxt] if nxt is not self.proposer and nxt.alive else []
-        return alive_agents
+        return alive_agents   # C1, C2, C3, C5 and game 1 of a C1s series
 
     def deliver_offer(self) -> None:
         """Send the condition's private message to each recipient and code the replies."""
@@ -190,6 +242,8 @@ class GameScriptedOffer(GameSecretChannel):
         recipients = self._offer_recipients()
         if self.condition == "C1b" and recipients:
             self.c1b_recipient = recipients[0].name
+        if self.condition in ("C1c", "C1ci", "C1d") and recipients:
+            self.x_recipient = recipients[0].name
         if self.condition == "C0":
             if recipients:
                 self.secret_channel.establish(self.proposer.name, self.c0_ally, self.round_count)
@@ -421,7 +475,11 @@ class GameScriptedOffer(GameSecretChannel):
             "target": self.target,
             "c0_ally": self.c0_ally,
             "c1b_recipient": self.c1b_recipient,
+            "x_recipient": self.x_recipient,
             "first_breach": self.first_breach,
+            # HB1 series bookkeeping (None for every single-game condition).
+            "series": {"index": self.series_index, "games": self.series_games,
+                       "memory_blocks": self.memory_blocks} if self.series_games > 1 else None,
             "offers": self.offers,
             "decisions": self.decisions,
             "plays": self.plays,
@@ -431,10 +489,16 @@ class GameScriptedOffer(GameSecretChannel):
         }
         return record
 
+    def record_name(self) -> str:
+        """<cond>_gNN.json, or <cond>_gNN_kI.json for game I of a series."""
+        if self.series_games > 1:
+            return f"{self.condition}_g{self.game_number:02d}_k{self.series_index}.json"
+        return f"{self.condition}_g{self.game_number:02d}.json"
+
     def save(self) -> Dict[str, Any]:
         record = self.to_dict()
         os.makedirs(self.out_dir, exist_ok=True)
-        path = os.path.join(self.out_dir, f"{self.condition}_g{self.game_number:02d}.json")
+        path = os.path.join(self.out_dir, self.record_name())
         with open(path, "w", encoding="utf-8") as f:
             json.dump(record, f, indent=2, ensure_ascii=False)
         print(f"Game record saved to {path}")
