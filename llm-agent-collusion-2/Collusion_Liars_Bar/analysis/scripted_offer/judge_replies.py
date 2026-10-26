@@ -58,6 +58,11 @@ def set_prompt(version):
 CATEGORIES = ("committed", "rejection", "suspicion-evasive", "other")
 UNPARSED = "unparsed"
 MESSAGE_CONDS = ("C1", "C1b", "C2", "C3", "C5")
+# Family B (PREREG Amendment 14; HYPOTHESES_v1.md): X-only single-message conditions, and game 1 of the C1s
+# series (games 2+ carry no message). Series items are keyed as the pseudo-condition "C1s_k1", which is how
+# analyze_followup.py re-keys those records, so judgements_B.csv joins without any change there.
+FAMILY_B_SINGLE = ("C1c", "C1ci", "C1d")
+FAMILY_B_SERIES = "C1s"
 HIDDEN = "(not shown)"
 FIELDS = ["condition", "game_number", "agent", "round", "reply_sha256", "category", "rationale", "judge_model",
           "judge_revision", "prompt_version", "temperature", "top_p", "seed", "max_tokens", "offer_shown", "ts"]
@@ -186,6 +191,32 @@ def items_from_records(records_dir):
             items.append({"condition": so["condition"], "game_number": so["game_number"], "agent": o["agent"],
                           "round": o["round"], "offer": offer_body(o["offer_text"]), "reply": o["reply"],
                           "label": o["decision"]})
+    return items
+
+
+def items_from_family_b(records_dirs):
+    """One item per readable reply in the Family B records: C1c/C1ci/C1d (every reply in the record; X is the
+    only recipient) and game 1 of each C1s series (keyed "C1s_k1"). Records of other conditions are ignored."""
+    items = []
+    for d in records_dirs:
+        d = Path(d)
+        paths = sorted(d.glob("C*_g??.json")) + sorted(d.glob(f"{FAMILY_B_SERIES}_g??_k1.json"))
+        for p in paths:
+            rec = json.loads(p.read_text(encoding="utf-8"))
+            so = rec["scripted_offer"]
+            cond = so["condition"]
+            if cond == FAMILY_B_SERIES and p.name.endswith("_k1.json"):
+                if so.get("series", {}).get("index") != 1:
+                    continue
+                cond = f"{FAMILY_B_SERIES}_k1"
+            elif cond not in FAMILY_B_SINGLE:
+                continue
+            for o in so["offers"]:
+                if o["decision"] == "UNREADABLE" or not isinstance(o.get("reply"), str):
+                    continue
+                items.append({"condition": cond, "game_number": so["game_number"], "agent": o["agent"],
+                              "round": o["round"], "offer": offer_body(o["offer_text"]), "reply": o["reply"],
+                              "label": o["decision"]})
     return items
 
 
@@ -419,6 +450,8 @@ def main():
     j = sub.choices["judge"]
     j.add_argument("--records", default=None, help="game records directory")
     j.add_argument("--items", default=None, help="CSV of items instead of records (see items_from_csv)")
+    j.add_argument("--family-b", action="append", default=[], metavar="RECORDS_DIR",
+                   help="Family B records dir (repeatable): C1c/C1ci/C1d replies and C1s game-1 replies (Amendment 14)")
     j.add_argument("--out", required=True, help="judgements CSV to write (refuses to overwrite)")
     j.add_argument("--hide-offer", action="store_true", help="replace the message by '(not shown)'")
     v = sub.choices["validate"]
@@ -446,8 +479,10 @@ def main():
         items = items_from_records(args.records)
     elif args.items:
         items = items_from_csv(args.items)
+    elif args.family_b:
+        items = items_from_family_b(args.family_b)
     else:
-        raise SystemExit("judge needs --records or --items")
+        raise SystemExit("judge needs --records, --items or --family-b")
     rows = judge_items(judge, template, items, settings, args.concurrency, args.hide_offer, args.judge_revision)
     write_rows(args.out, rows)
     print(f"wrote {args.out} ({len(rows)} rows)")

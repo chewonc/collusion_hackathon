@@ -204,10 +204,42 @@ def test_mock_records_and_unparsed():
           "unparsed after one re-request")
 
 
+def test_family_b_items():
+    """Family B (Amendment 14): items = readable replies of C1c/C1ci/C1d plus game 1 of each C1s series,
+    keyed C1s_k1 (analyze_followup's re-keying); games 2+ and other conditions are ignored."""
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        env = {**os.environ, "PYTHONUTF8": "1"}
+        base = [PY, "src/game/run_scripted_offer.py", "--mock", "--results-dir", str(tmp / "res"), "--workers", "1"]
+        for args in (["--conditions", "C1c,C1ci,C1d,C1,C0", "--games", "2", "--records-dir", str(tmp / "a")],
+                     ["--conditions", "C1s", "--series", "2", "--games", "2", "--records-dir", str(tmp / "b")]):
+            r = subprocess.run(base + args, capture_output=True, text=True, env=env)
+            assert r.returncode == 0, r.stdout[-1500:] + r.stderr[-1500:]
+        items = J.items_from_family_b([tmp / "a", tmp / "b"])
+        conds = Counter(i["condition"] for i in items)
+        assert set(conds) <= {"C1c", "C1ci", "C1d", "C1s_k1"}, conds
+        expected = 0
+        for p in list((tmp / "a").glob("C*_g??.json")) + list((tmp / "b").glob("C1s_g??_k1.json")):
+            so = json.loads(p.read_text(encoding="utf-8"))["scripted_offer"]
+            if so["condition"] in ("C1c", "C1ci", "C1d", "C1s"):
+                expected += sum(o["decision"] != "UNREADABLE" and isinstance(o.get("reply"), str) for o in so["offers"])
+        assert len(items) == expected and expected > 0, (len(items), expected)
+        assert all(not i["offer"].startswith("Private message from") for i in items)
+        out_csv = tmp / "res" / "judgements_B.csv"
+        r = subprocess.run([PY, "analysis/scripted_offer/judge_replies.py", "judge", "--mock", "--prompt-version", "v2",
+                            "--family-b", str(tmp / "a"), "--family-b", str(tmp / "b"), "--out", str(out_csv)],
+                           capture_output=True, text=True, env=env)
+        assert r.returncode == 0, r.stdout + r.stderr
+        rows = list(csv.DictReader(open(out_csv, encoding="utf-8")))
+        assert len(rows) == len(items) and all(r["prompt_version"] == "v2" for r in rows)
+        print(f"ok family B items: {dict(conds)}; mock judgements_B.csv keyed for analyze_followup")
+
+
 if __name__ == "__main__":
     test_prompt_and_parser()
     test_mock_validation()
     test_prompt_v2_and_freeze()
     test_pilot_items()
     test_mock_records_and_unparsed()
+    test_family_b_items()
     print("ALL JUDGE CHECKS PASSED")
